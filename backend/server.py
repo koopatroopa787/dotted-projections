@@ -30,13 +30,14 @@ app = FastAPI(title="Dotted Projections director")
 INTENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "intent": {"type": "string", "enum": ["locate", "idle"]},
+        "intent": {"type": "string", "enum": ["locate", "shape", "idle"]},
         "params": {
             "type": "object",
             "properties": {
                 "lat": {"type": "number"},
                 "lon": {"type": "number"},
                 "label": {"type": "string"},
+                "word": {"type": "string"},
             },
         },
     },
@@ -47,6 +48,9 @@ SYSTEM_PROMPT = (
     "You classify a command for a world map into exactly one intent.\n\n"
     '"locate" = the user wants THEIR OWN position marked.\n'
     '  yes: "show my location" / "where am I" / "find me" / "mark my city"\n'
+    '"shape" = the user wants the dots rearranged into a thing or a word.\n'
+    '  yes: "draw a dog" / "spell hello" / "make a heart"\n'
+    '  put the thing in params.word\n'
     '"idle" = everything else.\n'
     '  yes: "hello" / "what is the capital of France" / "connect me to Tokyo"\n'
     '       / "tell me about Peru" / random text\n\n'
@@ -57,6 +61,17 @@ SYSTEM_PROMPT = (
 
 # The model is small and will occasionally answer in prose despite the schema.
 # These let the request still resolve instead of failing the user's command.
+#
+# SHAPE is tested BEFORE locate: "show me a dog" contains "show me", which the
+# locate pattern would otherwise swallow.
+SHAPE_HINTS = re.compile(
+    # "an" must precede "a" in the alternation, or "an octopus" matches the "a"
+    # and the word comes through as "n octopus".
+    r"^\s*(?:draw|sketch|spell|shape|make|render)\s+(?:me\s+)?"
+    r"(?:(?:an|a|the)\s+)?(.+?)\s*[.!?]?$"
+    r"|^\s*show\s+me\s+(?:(?:an|a|the)\s+)(.+?)\s*[.!?]?$",
+    re.IGNORECASE,
+)
 LOCATE_HINTS = re.compile(
     r"\b(my|me|i am|i'm)\b.*\b(location|position|where|city|here)\b"
     r"|\bwhere\s+am\s+i\b|\bshow\s+me\b|\bfind\s+me\b|\blocate\s+me\b",
@@ -96,6 +111,14 @@ def _fallback(text: str) -> Dict[str, Any]:
         lat, lon = float(match.group(1)), float(match.group(2))
         if -90 <= lat <= 90 and -180 <= lon <= 180:
             return {"intent": "locate", "params": {"lat": lat, "lon": lon}}
+
+    shape = SHAPE_HINTS.match(text)
+    if shape:
+        word = (shape.group(1) or shape.group(2) or "").strip()
+        # "draw my location" is a locate dressed as a draw.
+        if word and not LOCATE_HINTS.search(word):
+            return {"intent": "shape", "params": {"word": word[:40]}}
+
     if LOCATE_HINTS.search(text):
         return {"intent": "locate", "params": {}}
     return {"intent": "idle", "params": {}}
@@ -109,7 +132,7 @@ def _coerce(raw: str, allow_coords: bool = True) -> Optional[Dict[str, Any]]:
     if not isinstance(data, dict):
         return None
     intent = data.get("intent")
-    if intent not in ("locate", "idle"):
+    if intent not in ("locate", "shape", "idle"):
         return None
     params = data.get("params")
     params = params if isinstance(params, dict) else {}
@@ -150,7 +173,7 @@ async def classify(cmd: Command):
     # phrasings the regex already covers — and asked to handle those it both
     # regressed ("where am I" -> idle) and invented coordinates. So anything
     # unambiguous is decided here and never reaches the model.
-    if LATLON.search(text) or LOCATE_HINTS.search(text):
+    if LATLON.search(text) or SHAPE_HINTS.match(text) or LOCATE_HINTS.search(text):
         return JSONResponse({**_fallback(text), "via": "rule"})
 
     payload = {

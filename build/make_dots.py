@@ -72,22 +72,26 @@ def point_in_polygon(x, y, polygon):
     return inside
 
 
-# Sub-samples per axis within a cell. 3 means the centre plus a 3x3 lattice,
-# which is enough to catch an island a few hundred km across at a 6-degree step
-# without meaningfully fattening continental coastlines.
-SUBSAMPLE = 3
+# Sub-samples per axis within each cell: 4 gives a 4x4 = 16-point estimate of
+# how much of the cell is land.
+SUBSAMPLE = 4
+
+# Minimum land coverage for a cell to become a dot.
+#
+# Filling on ANY land (1/16) catches every island but also fills the marginal
+# sea cells along a coast, which welds Japan onto Korea and Madagascar onto
+# Mozambique — the straits disappear. Requiring a real share of the cell keeps
+# open water open while still catching islands that genuinely fill one.
+COVERAGE_MIN = 0.20
 
 
 def cell_samples(lat, lon, step):
-    """Centre first (most cells resolve there), then a lattice across the cell."""
-    yield lat, lon
+    """A uniform lattice across the cell; the fraction that hits land is coverage."""
     half = step / 2.0
     for i in range(SUBSAMPLE):
         for j in range(SUBSAMPLE):
             dy = -half + (i + 0.5) * (step / SUBSAMPLE)
             dx = -half + (j + 0.5) * (step / SUBSAMPLE)
-            if dy == 0 and dx == 0:
-                continue
             yield lat + dy, lon + dx
 
 
@@ -108,7 +112,7 @@ def load_countries():
     return entries
 
 
-def build(step: float):
+def build(step: float, coverage_min: float = COVERAGE_MIN):
     countries = load_countries()
     names, name_index = [], {}
 
@@ -124,24 +128,26 @@ def build(step: float):
             continue
         for col in range(n_cols):
             lon = -180.0 + col * step
-            # A dot means "there is land in this cell", not "there is land at
-            # this exact point". Centre-sampling at the reference's spacing
-            # drops the UK, Ireland, Cuba and Japan entirely — features the
-            # reference clearly shows — because a 6-degree cell can straddle a
+            # A dot means "enough of this cell is land", not "land sits exactly
+            # at its centre". Centre-sampling at this spacing drops the UK,
+            # Ireland and Japan entirely, because a 6-degree cell can straddle a
             # small island without its centre touching land.
-            hit = None
+            hits, total, tally = 0, 0, {}
             for sub_lat, sub_lon in cell_samples(lat, lon, step):
+                total += 1
                 for c in band:
                     x0, y0, x1, y1 = c["bbox"]
                     if sub_lon < x0 or sub_lon > x1 or sub_lat < y0 or sub_lat > y1:
                         continue
                     if point_in_polygon(sub_lon, sub_lat, c["polygon"]):
-                        hit = c
+                        hits += 1
+                        tally[c["name"]] = tally.get(c["name"], 0) + 1
                         break
-                if hit is not None:
-                    break
-            if hit is None:
+            if not hits or hits / total < coverage_min:
                 continue
+            # The country that covers most of the cell owns the dot.
+            winner = max(tally, key=tally.get)
+            hit = next(c for c in band if c["name"] == winner)
 
             key = hit["name"]
             if key not in name_index:
@@ -150,6 +156,47 @@ def build(step: float):
             cols.append(col)
             rows.append(row)
             country_ids.append(name_index[key])
+
+    # Rescue pass: a threshold that keeps the straits open also erases countries
+    # smaller than it. Sri Lanka fills about 1/16 of a 6-degree cell, so any
+    # threshold that stops Japan welding onto Korea also deletes Sri Lanka.
+    # Rather than trade one against the other, give every country that ended up
+    # with no dots its single best cell, provided that cell is still free.
+    taken = set(zip(cols, rows))
+    present = {names[c]["name"] for c in country_ids}
+    missing = {c["name"] for c in countries} - present
+
+    for country_name in sorted(missing):
+        polygons = [c for c in countries if c["name"] == country_name]
+        best = None  # (coverage, col, row, entry)
+        for entry in polygons:
+            x0, y0, x1, y1 = entry["bbox"]
+            for row in range(n_rows + 1):
+                lat = LAT_MAX - row * step
+                if not (y0 - step <= lat <= y1 + step):
+                    continue
+                for col in range(n_cols):
+                    lon = -180.0 + col * step
+                    if not (x0 - step <= lon <= x1 + step):
+                        continue
+                    if (col, row) in taken:
+                        continue
+                    hits = sum(
+                        1 for sub_lat, sub_lon in cell_samples(lat, lon, step)
+                        if point_in_polygon(sub_lon, sub_lat, entry["polygon"])
+                    )
+                    if hits and (best is None or hits > best[0]):
+                        best = (hits, col, row, entry)
+        if best is None:
+            continue
+        _, col, row, entry = best
+        if entry["name"] not in name_index:
+            name_index[entry["name"]] = len(names)
+            names.append({"name": entry["name"], "iso": entry["iso"]})
+        cols.append(col)
+        rows.append(row)
+        country_ids.append(name_index[entry["name"]])
+        taken.add((col, row))
 
     return {
         "step": step,
@@ -170,12 +217,14 @@ def build(step: float):
 
 if __name__ == "__main__":
     step = float(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_STEP
-    grid = build(step)
+    coverage = float(sys.argv[2]) if len(sys.argv) > 2 else COVERAGE_MIN
+    grid = build(step, coverage)
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(grid, separators=(",", ":")), encoding="utf-8")
     size_kb = OUTPUT.stat().st_size / 1024
     print(
-        f"step={step}deg  grid={grid['nCols']}x{grid['nRows']}  "
+        f"step={step}deg cov={coverage:.2f}  "
+        f"grid={grid['nCols']}x{grid['nRows']}  "
         f"land dots={grid['count']}  countries={len(grid['countries'])}  "
         f"{size_kb:.0f}KB -> {OUTPUT}"
     )

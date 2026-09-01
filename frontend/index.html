@@ -90,7 +90,7 @@
 </head>
 <body>
 <canvas id="map"></canvas>
-<div id="status">initialising</div>
+<div id="status">loading the map</div>
 <div id="label"></div>
 <form id="console" autocomplete="off">
   <input id="cmd" name="cmd" placeholder="show my location" aria-label="command">
@@ -116,6 +116,7 @@
   let dots = [];        // { lon, lat, country, phase, hx, hy } in grid space
   let view = { x: 0, y: 0, w: 1, h: 1, cell: 1 };
   let marker = null;    // { lon, lat, index, born, label }
+  let morph = null;     // { dir: 1 into shape, -1 back to map, born }
   let dpr = 1;
 
   // ── Projection ─────────────────────────────────────────────────────────────
@@ -191,6 +192,7 @@
   // Drift scales with the dot pitch: a fixed pixel wander is invisible on a
   // coarse grid and jittery on a fine one.
   const DRIFT_RATIO = 0.045;
+  const MORPH_SECONDS = 1.15;
 
   function draw(now) {
     const t = now / 1000;
@@ -204,19 +206,42 @@
       const r = Math.max(0.7, view.cell * 0.40);
       const drift = view.cell * DRIFT_RATIO;
 
-      // One path for every base dot, filled once — 10k individual fill calls
-      // would not hold 60fps, one fill of 10k subpaths does.
+      // Morph progress: 0 = map, 1 = shape. Eased both ways.
+      let m = 0;
+      if (morph) {
+        const raw = Math.min(1, (t - morph.born) / MORPH_SECONDS);
+        const eased = raw < 0.5 ? 4 * raw ** 3 : 1 - (-2 * raw + 2) ** 3 / 2;
+        m = morph.dir === 1 ? eased : 1 - eased;
+        if (raw >= 1 && morph.dir === -1) morph = null;
+      }
+
+      // Two paths: dots that belong to the shape, and dots left over. Leftovers
+      // fade rather than piling up somewhere arbitrary.
       const path = new Path2D();
+      const spare = new Path2D();
       for (let i = 0; i < dots.length; i++) {
         const d = dots[i];
         const p = project(d.lon, d.lat);
         const wob = Math.sin(t * 0.55 + d.phase) * drift;
         const wob2 = Math.cos(t * 0.41 + d.phase * 1.7) * drift;
-        path.moveTo(p.x + wob + r, p.y + wob2);
-        path.arc(p.x + wob, p.y + wob2, r, 0, Math.PI * 2);
+        let x = p.x + wob, y = p.y + wob2;
+
+        const inShape = m > 0 && d.tgx != null;
+        if (inShape) {
+          x += (view.x + d.tgx * view.w - x) * m;
+          y += (view.y + d.tgy * view.h - y) * m;
+        }
+        const target = (m > 0 && d.tgx == null) ? spare : path;
+        target.moveTo(x + r, y);
+        target.arc(x, y, r, 0, Math.PI * 2);
       }
       ctx.fillStyle = getVar("--dot");
       ctx.fill(path);
+      if (m > 0) {
+        ctx.globalAlpha = 1 - m * 0.88;
+        ctx.fill(spare);
+        ctx.globalAlpha = 1;
+      }
 
       if (marker) drawMarker(t, r);
     }
@@ -227,39 +252,21 @@
     const d = dots[marker.index];
     if (!d) return;
     const p = project(d.lon, d.lat);
-    const age = t - marker.born;
 
-    // Expanding ring, repeating slowly.
-    const cycle = (age % 2.6) / 2.6;
-    const ringR = r * 2 + cycle * view.cell * 5;
+    // One dot, lit — same size as every other. Growing it or glowing its
+    // neighbours makes the marked place look physically bigger than it is,
+    // which on a map is a lie about area.
+    const pulse = 0.72 + 0.28 * Math.sin((t - marker.born) * 3.0);
     ctx.beginPath();
-    ctx.arc(p.x, p.y, ringR, 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(255,180,84,${0.5 * (1 - cycle)})`;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    // Neighbours glow, so the mark reads as a place, not a pixel.
-    const glow = new Path2D();
-    for (let i = 0; i < dots.length; i++) {
-      const o = dots[i];
-      if (Math.abs(o.lon - d.lon) > grid.step * 2.2) continue;
-      if (Math.abs(o.lat - d.lat) > grid.step * 2.2) continue;
-      if (i === marker.index) continue;
-      const q = project(o.lon, o.lat);
-      glow.moveTo(q.x + r, q.y);
-      glow.arc(q.x, q.y, r, 0, Math.PI * 2);
-    }
-    ctx.fillStyle = getVar("--dot-lit");
-    ctx.fill(glow);
-
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, r * 1.9, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.globalAlpha = pulse;
     ctx.fillStyle = getVar("--accent");
     ctx.fill();
+    ctx.globalAlpha = 1;
 
     if (marker.label) {
       labelEl.textContent = marker.label;
-      labelEl.style.left = (p.x + 14) + "px";
+      labelEl.style.left = (p.x + r + 8) + "px";
       labelEl.style.top = (p.y - 6) + "px";
       labelEl.classList.add("on");
     }
@@ -274,24 +281,135 @@
     return varCache[name];
   }
 
+  // ── Shapes ─────────────────────────────────────────────────────────────────
+  // The dots rearrange into a shape by sampling a glyph rendered offscreen at
+  // the grid's own resolution. An emoji gives a real silhouette for a common
+  // noun; anything without one falls back to spelling the word, which always
+  // works. No drawing model is involved — a 0.5B model cannot draw a dog, but
+  // the font on the machine already knows what one looks like.
+  const EMOJI = {
+    dog:"🐕", cat:"🐈", heart:"❤️", star:"⭐", tree:"🌳", fish:"🐟", bird:"🐦",
+    house:"🏠", home:"🏠", car:"🚗", plane:"✈️", rocket:"🚀", boat:"⛵",
+    sun:"☀️", moon:"🌙", cloud:"☁️", rain:"🌧️", snow:"❄️", fire:"🔥",
+    skull:"💀", ghost:"👻", alien:"👽", robot:"🤖", brain:"🧠", eye:"👁️",
+    hand:"✋", flower:"🌸", leaf:"🍃", apple:"🍎", pizza:"🍕", coffee:"☕",
+    beer:"🍺", cake:"🎂", gift:"🎁", key:"🔑", lock:"🔒", clock:"🕐",
+    globe:"🌍", earth:"🌍", world:"🌍", map:"🗺️", anchor:"⚓", crown:"👑",
+    diamond:"💎", music:"🎵", camera:"📷", phone:"📱", book:"📖", pencil:"✏️",
+    lightning:"⚡", bolt:"⚡", umbrella:"☂️", balloon:"🎈", bomb:"💣",
+    whale:"🐳", turtle:"🐢", snake:"🐍", horse:"🐴", cow:"🐄", pig:"🐖",
+    bear:"🐻", panda:"🐼", monkey:"🐒", elephant:"🐘", butterfly:"🦋",
+    spider:"🕷️", bee:"🐝", crab:"🦀", octopus:"🐙", penguin:"🐧",
+  };
+
+  /**
+   * Rasterise a glyph and return the cells it covers, in normalised view space.
+   * Sampling at the grid's own resolution keeps the result on the same lattice
+   * as the map, so the transition reads as the same dots moving.
+   */
+  function glyphTargets(text, { cols = grid.nCols, rows = grid.nRows } = {}) {
+    const S = 8;                       // supersample per cell, for a clean edge
+    const off = document.createElement("canvas");
+    off.width = cols * S;
+    off.height = rows * S;
+    const octx = off.getContext("2d", { willReadFrequently: true });
+    octx.fillStyle = "#000";
+    octx.fillRect(0, 0, off.width, off.height);
+
+    octx.fillStyle = "#fff";
+    octx.textAlign = "center";
+    octx.textBaseline = "middle";
+
+    // Grow the type until it fills the frame, then draw once.
+    let size = off.height * 0.9;
+    octx.font = `900 ${size}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",ui-monospace,monospace`;
+    const w = octx.measureText(text).width;
+    if (w > off.width * 0.92) {
+      size = size * (off.width * 0.92) / w;
+      octx.font = `900 ${size}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",ui-monospace,monospace`;
+    }
+    octx.fillText(text, off.width / 2, off.height / 2);
+
+    const data = octx.getImageData(0, 0, off.width, off.height).data;
+    const targets = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        let lit = 0;
+        for (let sy = 0; sy < S; sy += 2) {
+          for (let sx = 0; sx < S; sx += 2) {
+            const px = (c * S + sx), py = (r * S + sy);
+            const i = (py * off.width + px) * 4;
+            // Any channel: emoji are colour, text is white.
+            if (data[i] > 90 || data[i + 1] > 90 || data[i + 2] > 90) lit++;
+          }
+        }
+        if (lit >= 3) targets.push({ gx: (c + 0.5) / cols, gy: (r + 0.5) / rows });
+      }
+    }
+    return targets;
+  }
+
+  /** Give each target the nearest still-unclaimed dot, so paths do not cross. */
+  function assignTargets(targets) {
+    for (const d of dots) { d.tgx = null; d.tgy = null; }
+    const used = new Uint8Array(dots.length);
+    for (const t of targets) {
+      let best = -1, bestD = Infinity;
+      for (let i = 0; i < dots.length; i++) {
+        if (used[i]) continue;
+        const hx = (dots[i].lon + 180) / 360;
+        const hy = (grid.latMax - dots[i].lat) / (grid.latMax - grid.latMin);
+        const dx = hx - t.gx, dy = hy - t.gy;
+        const v = dx * dx + dy * dy;
+        if (v < bestD) { bestD = v; best = i; }
+      }
+      if (best < 0) break;
+      used[best] = 1;
+      dots[best].tgx = t.gx;
+      dots[best].tgy = t.gy;
+    }
+    return targets.length;
+  }
+
+  function doShape(word) {
+    const clean = (word || "").trim().toLowerCase();
+    if (!clean) return;
+    const glyph = EMOJI[clean] || EMOJI[clean.replace(/s$/, "")];
+    const targets = glyphTargets(glyph || clean.toUpperCase().slice(0, 10));
+    if (!targets.length) { setStatus("cannot draw that"); return; }
+    assignTargets(targets);
+    morph = { dir: 1, born: performance.now() / 1000 };
+    marker = null;
+    labelEl.classList.remove("on");
+    setStatus(glyph ? `${clean} ${glyph}` : clean);
+  }
+
+  function releaseShape() {
+    if (morph && morph.dir === 1) morph = { dir: -1, born: performance.now() / 1000 };
+  }
+
   // ── Intents ────────────────────────────────────────────────────────────────
   // The director only ever emits one of these. All motion is client-side.
   function applyIntent(intent) {
     if (!intent || !intent.intent) return;
     switch (intent.intent) {
       case "locate":
+        releaseShape();
         return doLocate(intent.params || {});
+      case "shape":
+        return doShape((intent.params || {}).word);
       case "idle":
       default:
         marker = null;
+        releaseShape();
         labelEl.classList.remove("on");
-        setStatus("idle");
+        setStatus("");
     }
   }
 
   function markAt(lon, lat, label) {
     const index = nearestDot(lon, lat);
-    if (index < 0) { setStatus("no land dot near that point"); return; }
+    if (index < 0) { setStatus("no land near there"); return; }
     marker = { index, born: performance.now() / 1000, label };
     const country = grid.countries[dots[index].country];
     setStatus(label || (country ? country.name : "located"));
@@ -302,7 +420,7 @@
       markAt(params.lon, params.lat, params.label);
       return;
     }
-    setStatus("resolving position", true);
+    setStatus("finding you", true);
 
     // Browser geolocation first; it is the accurate one and needs consent.
     const viaBrowser = await new Promise((resolve) => {
@@ -325,12 +443,12 @@
         return;
       }
     } catch (_) { /* fall through */ }
-    setStatus("could not resolve position");
+    setStatus("couldn’t work out where you are");
   }
 
   // ── Director ───────────────────────────────────────────────────────────────
   async function send(text) {
-    setStatus("thinking", true);
+    setStatus("reading that", true);
     try {
       const res = await fetch("/api/intent", {
         method: "POST",
@@ -340,7 +458,7 @@
       if (!res.ok) throw new Error("intent " + res.status);
       applyIntent(await res.json());
     } catch (err) {
-      setStatus("director unreachable");
+      setStatus("no answer from the server");
     }
   }
 
@@ -359,11 +477,11 @@
   // ── Boot ───────────────────────────────────────────────────────────────────
   loadGrid()
     .then(() => {
-      setStatus(`${grid.count.toLocaleString()} land dots · ${grid.step}° grid`);
+      setStatus(`${grid.count} dots, one per ${grid.step}° of the real world`);
       requestAnimationFrame(draw);
-      setTimeout(() => setStatus("idle"), 3200);
+      setTimeout(() => setStatus(""), 4000);
     })
-    .catch((err) => setStatus("map failed: " + err.message));
+    .catch((err) => setStatus("the map did not load"));
 })();
 </script>
 </body>
