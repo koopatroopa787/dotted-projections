@@ -228,26 +228,31 @@
         p = raw < 0.5 ? 4 * raw ** 3 : 1 - (-2 * raw + 2) ** 3 / 2;
       }
 
+      // Three groups: dots that were already lit, dots joining the shape (they
+      // have to fade in or they pop into existence mid-flight), and dots
+      // leaving it.
       const solid = new Path2D();
-      const fading = new Path2D();
+      const arriving = new Path2D();
+      const leaving = new Path2D();
       for (let i = 0; i < dots.length; i++) {
         const d = dots[i];
         d.cx = d.fx + (d.tx - d.fx) * p;
         d.cy = d.fy + (d.ty - d.fy) * p;
         const x = sx(d.cx) + Math.sin(t * 0.55 + d.phase) * drift;
         const y = sy(d.cy) + Math.cos(t * 0.41 + d.phase * 1.7) * drift;
-        const into = d.active ? solid : fading;
+        const into = !d.active ? leaving : (d.wasActive === false ? arriving : solid);
         into.moveTo(x + r, y);
         into.arc(x, y, r, 0, Math.PI * 2);
       }
       ctx.fillStyle = getVar("--dot");
       ctx.fill(solid);
-      const spareAlpha = Math.max(0, 1 - p * 1.7);
-      if (spareAlpha > 0.01) {
-        ctx.globalAlpha = spareAlpha;
-        ctx.fill(fading);
-        ctx.globalAlpha = 1;
-      }
+
+      ctx.globalAlpha = Math.min(1, p * 1.4);
+      ctx.fill(arriving);
+      const leavingAlpha = Math.max(0, 1 - p * 2.2);
+      ctx.globalAlpha = leavingAlpha;
+      if (leavingAlpha > 0.01) ctx.fill(leaving);
+      ctx.globalAlpha = 1;
 
       if (marker) drawMarker(t, r);
     }
@@ -347,9 +352,11 @@
       ? Math.max(8, Math.round(cols * (cssH / Math.max(1, cssW))))
       : grid.nRows;
     const b = box || { x0: 0.03, y0: 0.14, x1: 0.97, y1: 0.86 };
-    // Small text has thin strokes, so demanding two lit sub-samples per cell
-    // punches holes in the letterforms. One is enough at chat size.
-    const need = minLit || 2;
+    // Fraction of a cell that must be ink. Too high and thin strokes break up;
+    // too low and neighbouring strokes merge into blobs, which is what turned
+    // MATRIX into an unreadable smear. Letters want about half, silhouettes
+    // want much less so they fill.
+    const need = (minLit || 0.25) * 9;
     const off = document.createElement("canvas");
     off.width = cols * SUPER;
     off.height = rows * SUPER;
@@ -401,7 +408,11 @@
   function setTargets(targets) {
     const n = dots.length;
     const used = new Uint8Array(n);
-    for (const d of dots) { d.fx = d.cx; d.fy = d.cy; d.active = false; }
+    for (const d of dots) {
+      d.fx = d.cx; d.fy = d.cy;
+      d.wasActive = d.active;
+      d.active = false;
+    }
 
     for (const t of targets) {
       let best = -1, bestD = Infinity;
@@ -415,9 +426,12 @@
       used[best] = 1;
       dots[best].tx = t.gx; dots[best].ty = t.gy; dots[best].active = true;
     }
-    // Everything unused drifts home and fades out.
+
+    // Leftovers fade out WHERE THEY ARE. Sending them home meant the world map
+    // visibly reassembled between one greeting and the next, which is the very
+    // thing the from-current-position change was supposed to stop.
     for (let i = 0; i < n; i++) {
-      if (!used[i]) { dots[i].tx = dots[i].hx; dots[i].ty = dots[i].hy; }
+      if (!used[i]) { dots[i].tx = dots[i].cx; dots[i].ty = dots[i].cy; }
     }
     morphStart = performance.now() / 1000;
   }
@@ -453,8 +467,8 @@
 
   // ── Chat: a transcript in dots, small, stacking down from the top ──────────
   const CHAT_MAX_LINES = 6;
-  const CHAT_WRAP = 14;        // characters per dot line — keeps glyphs legible
-  const CHAT_TOP = 0.07, CHAT_LINE = 0.10;   // fractions of SCREEN height
+  const CHAT_WRAP = 11;        // characters per dot line — fewer means bigger letters
+  const CHAT_TOP = 0.07, CHAT_LINE = 0.125;  // fractions of SCREEN height
 
   /**
    * Chat is positioned against the SCREEN, not the map box. The map is
@@ -469,7 +483,7 @@
       const y0 = CHAT_TOP + i * CHAT_LINE;
       all = all.concat(glyphTargets(line, {
         x0: 0.08, y0, x1: 0.92, y1: y0 + CHAT_LINE * 0.74,
-      }, 1, true));
+      }, 0.5, true));   // letters need ~half a cell of ink to stay crisp
     });
     return all;
   }
