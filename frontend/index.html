@@ -241,6 +241,14 @@
         const d = dots[i];
         d.cx = d.fx + (d.tx - d.fx) * p;
         d.cy = d.fy + (d.ty - d.fy) * p;
+
+        // Dormant: faded out already and not wanted by this shape either. Drawn
+        // at all, it flashes back to full opacity at the start of every morph,
+        // because the leaving fade is a function of p and p restarts at zero.
+        // These are the dots still sitting on their continents, which is
+        // exactly the ghost map that kept coming back.
+        if (!d.active && d.wasActive === false) continue;
+
         const x = sx(d.cx) + Math.sin(t * 0.55 + d.phase) * drift;
         const y = sy(d.cy) + Math.cos(t * 0.41 + d.phase * 1.7) * drift;
         const into = !d.active ? leaving : (d.wasActive === false ? arriving : solid);
@@ -459,6 +467,7 @@
     for (const d of dots) {
       d.fx = d.cx; d.fy = d.cy;
       d.tx = d.hx; d.ty = d.hy;
+      d.wasActive = d.active;   // dormant dots have to fade back in, not pop
       d.active = true;
     }
     morphStart = performance.now() / 1000;
