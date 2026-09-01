@@ -124,7 +124,10 @@
   // Animating from the map each time is what made the world flash back between
   // one greeting and the next.
   let morphStart = -1;
-  const MORPH_SECONDS = 1.05;
+  // ?slow stretches every transition, which is the only practical way to look
+  // at one frame by frame.
+  const MORPH_SECONDS =
+    new URLSearchParams(location.search).has("slow") ? 7 : 1.05;
 
   let introTimer = null, chatTimer = null;
   let chatLines = [];
@@ -247,11 +250,19 @@
       ctx.fillStyle = getVar("--dot");
       ctx.fill(solid);
 
-      ctx.globalAlpha = Math.min(1, p * 1.4);
-      ctx.fill(arriving);
-      const leavingAlpha = Math.max(0, 1 - p * 2.2);
-      ctx.globalAlpha = leavingAlpha;
-      if (leavingAlpha > 0.01) ctx.fill(leaving);
+      // Arrivals stay invisible until they are most of the way across. They set
+      // off from wherever they faded out — often still in map formation — so
+      // showing them early paints a ghost of the world above the word.
+      const arrivingAlpha = Math.max(0, Math.min(1, (p - 0.55) / 0.35));
+      if (arrivingAlpha > 0.01) {
+        ctx.globalAlpha = arrivingAlpha;
+        ctx.fill(arriving);
+      }
+      const leavingAlpha = Math.max(0, 1 - p * 2.6);
+      if (leavingAlpha > 0.01) {
+        ctx.globalAlpha = leavingAlpha;
+        ctx.fill(leaving);
+      }
       ctx.globalAlpha = 1;
 
       if (marker) drawMarker(t, r);
@@ -414,17 +425,25 @@
       d.active = false;
     }
 
-    for (const t of targets) {
-      let best = -1, bestD = Infinity;
-      for (let i = 0; i < n; i++) {
-        if (used[i]) continue;
-        const dx = dots[i].cx - t.gx, dy = dots[i].cy - t.gy;
-        const v = dx * dx + dy * dy;
-        if (v < bestD) { bestD = v; best = i; }
+    // Two passes. Dots that are already lit get first refusal on every target,
+    // so one word hands its dots to the next instead of summoning faded ones
+    // that are still parked on their continents.
+    for (const onlyLit of [true, false]) {
+      for (const t of targets) {
+        if (t.taken) continue;
+        let best = -1, bestD = Infinity;
+        for (let i = 0; i < n; i++) {
+          if (used[i]) continue;
+          if (onlyLit && !dots[i].wasActive) continue;
+          const dx = dots[i].cx - t.gx, dy = dots[i].cy - t.gy;
+          const v = dx * dx + dy * dy;
+          if (v < bestD) { bestD = v; best = i; }
+        }
+        if (best < 0) continue;
+        used[best] = 1;
+        t.taken = true;
+        dots[best].tx = t.gx; dots[best].ty = t.gy; dots[best].active = true;
       }
-      if (best < 0) break;
-      used[best] = 1;
-      dots[best].tx = t.gx; dots[best].ty = t.gy; dots[best].active = true;
     }
 
     // Leftovers fade out WHERE THEY ARE. Sending them home meant the world map
@@ -681,7 +700,7 @@
       // Latin rather than showing an empty screen.
       if (!showGlyph(g.native)) showGlyph(g.latin.toUpperCase());
       setStatus(`${g.latin} · ${g.lang}`);
-      introTimer = setTimeout(step, 2600);
+      introTimer = setTimeout(step, MORPH_SECONDS > 3 ? 9000 : 2600);
     };
     step();
   }
