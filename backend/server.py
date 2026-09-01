@@ -25,40 +25,6 @@ REQUEST_TIMEOUT = 25.0
 
 app = FastAPI(title="Dotted Projections director")
 
-# Intents are a closed set. Adding one here and in the frontend switch is the
-# whole extension path — the model is never asked to invent a shape.
-INTENT_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "intent": {"type": "string", "enum": ["locate", "shape", "idle"]},
-        "params": {
-            "type": "object",
-            "properties": {
-                "lat": {"type": "number"},
-                "lon": {"type": "number"},
-                "label": {"type": "string"},
-                "word": {"type": "string"},
-            },
-        },
-    },
-    "required": ["intent"],
-}
-
-SYSTEM_PROMPT = (
-    "You classify a command for a world map into exactly one intent.\n\n"
-    '"locate" = the user wants THEIR OWN position marked.\n'
-    '  yes: "show my location" / "where am I" / "find me" / "mark my city"\n'
-    '"shape" = the user wants the dots rearranged into a thing or a word.\n'
-    '  yes: "draw a dog" / "spell hello" / "make a heart"\n'
-    '  put the thing in params.word\n'
-    '"idle" = everything else.\n'
-    '  yes: "hello" / "what is the capital of France" / "connect me to Tokyo"\n'
-    '       / "tell me about Peru" / random text\n\n'
-    "A question about a place is NOT locate — locate is only about the user.\n"
-    "Reply with JSON only. Do not add params unless the user gave an explicit "
-    "latitude and longitude."
-)
-
 # The model is small and will occasionally answer in prose despite the schema.
 # These let the request still resolve instead of failing the user's command.
 #
@@ -79,6 +45,19 @@ LOCATE_HINTS = re.compile(
 )
 LATLON = re.compile(
     r"(-?\d{1,2}(?:\.\d+)?)\s*[,/ ]\s*(-?\d{1,3}(?:\.\d+)?)"
+)
+REVERSE_HINTS = re.compile(r"\b(reverse|invert|inverse|negative)\b", re.IGNORECASE)
+CHAT_HINTS = re.compile(
+    r"\btalk\s+to\s+me\b|\bsay\s+something\b|\bchat\b|\?\s*$", re.IGNORECASE
+)
+
+# The dots spell the reply one word at a time, so a long answer is unreadable.
+CHAT_MAX_CHARS = 34
+CHAT_PROMPT = (
+    "You are the voice of a dot-matrix world map. Reply with ONE complete "
+    "thought of five words or fewer. It must stand on its own and never "
+    "trail off mid-sentence. No punctuation, no emoji, no quotes. "
+    "Good replies: I AM LISTENING / THE WORLD IS QUIET / ASK ME ANYTHING"
 )
 
 
@@ -105,12 +84,19 @@ class Command(BaseModel):
 
 
 def _fallback(text: str) -> Dict[str, Any]:
-    """Deterministic classification, used when the model is unavailable or vague."""
+    """
+    Deterministic classification. Every input lands somewhere: a bare word is a
+    shape request, because typing "cat" and watching nothing happen is the worst
+    thing this interface can do.
+    """
     match = LATLON.search(text)
     if match:
         lat, lon = float(match.group(1)), float(match.group(2))
         if -90 <= lat <= 90 and -180 <= lon <= 180:
             return {"intent": "locate", "params": {"lat": lat, "lon": lon}}
+
+    if REVERSE_HINTS.search(text):
+        return {"intent": "reverse", "params": {}}
 
     shape = SHAPE_HINTS.match(text)
     if shape:
@@ -121,29 +107,15 @@ def _fallback(text: str) -> Dict[str, Any]:
 
     if LOCATE_HINTS.search(text):
         return {"intent": "locate", "params": {}}
-    return {"intent": "idle", "params": {}}
 
+    if CHAT_HINTS.search(text):
+        return {"intent": "chat", "params": {}}
 
-def _coerce(raw: str, allow_coords: bool = True) -> Optional[Dict[str, Any]]:
-    try:
-        data = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    intent = data.get("intent")
-    if intent not in ("locate", "shape", "idle"):
-        return None
-    params = data.get("params")
-    params = params if isinstance(params, dict) else {}
-
-    # The model happily emits lat/lon it was never given — 37.7749,-122.4194
-    # (San Francisco) for any prompt mentioning a location. Marking a
-    # hallucinated city for every visitor is worse than marking nothing, so
-    # coordinates survive only when the user actually typed some.
-    if not allow_coords:
-        params = {k: v for k, v in params.items() if k not in ("lat", "lon")}
-    return {"intent": intent, "params": params}
+    # Anything short and unclaimed is a thing to draw. Longer prose is talk.
+    words = text.split()
+    if 1 <= len(words) <= 3 and len(text) <= 24:
+        return {"intent": "shape", "params": {"word": text.strip()[:24]}}
+    return {"intent": "chat", "params": {}}
 
 
 @app.get("/health")
@@ -168,37 +140,55 @@ async def classify(cmd: Command):
     if not text:
         return JSONResponse({"intent": "idle", "params": {}})
 
-    # Rules first, model second. A 0.5B classifier is genuinely useful for the
-    # long tail of phrasings, but it is not more reliable than a regex on the
-    # phrasings the regex already covers — and asked to handle those it both
-    # regressed ("where am I" -> idle) and invented coordinates. So anything
-    # unambiguous is decided here and never reaches the model.
-    if LATLON.search(text) or SHAPE_HINTS.match(text) or LOCATE_HINTS.search(text):
-        return JSONResponse({**_fallback(text), "via": "rule"})
+    # Rules decide the intent — the 0.5B model is not more reliable than a regex
+    # at this, and asked to do it it both regressed ("where am I" -> idle) and
+    # invented coordinates. The model's job is writing the chat reply, which is
+    # the one thing here a regex cannot do.
+    decision = _fallback(text)
 
+    if decision["intent"] == "chat":
+        reply = await _chat_reply(text)
+        return JSONResponse({
+            "intent": "chat",
+            "params": {"reply": reply},
+            "via": "model" if reply else "fallback",
+        })
+
+    return JSONResponse({**decision, "via": "rule"})
+
+
+async def _chat_reply(text: str) -> str:
+    """A few words back, or empty if the model is unavailable."""
     payload = {
         "model": MODEL,
-        "format": INTENT_SCHEMA,   # Ollama constrains sampling to this shape.
         "stream": False,
-        "options": {"temperature": 0, "num_predict": 64},
+        "options": {"temperature": 0.7, "num_predict": 24},
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": CHAT_PROMPT},
             {"role": "user", "content": text},
         ],
     }
-
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             res = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
             res.raise_for_status()
-            content = res.json().get("message", {}).get("content", "")
-        intent = _coerce(content, allow_coords=False)
-        if intent is not None:
-            return JSONResponse({**intent, "via": "model"})
+            raw = res.json().get("message", {}).get("content", "")
     except Exception:
-        pass
+        return ""
 
-    return JSONResponse({**_fallback(text), "via": "fallback"})
+    # Keep only what the dot renderer can draw, and cap the length. The model
+    # overshoots "five words or fewer" often enough to matter, and a reply cut
+    # mid-sentence reads worse than a short one, so trim on a word boundary.
+    # Whole words only. Slicing the joined string by character count cut
+    # "WHENEVER" to "WHENEVE", and a dot-drawn half-word just looks broken.
+    words = re.findall(r"[A-Za-z0-9']+", raw)[:5]
+    out, used = [], 0
+    for w in words:
+        if used + len(w) + (1 if out else 0) > CHAT_MAX_CHARS:
+            break
+        used += len(w) + (1 if out else 0)
+        out.append(w)
+    return " ".join(out).upper()
 
 
 def _client_ip(request: Request) -> str:

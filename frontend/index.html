@@ -6,13 +6,11 @@
 <title>Dotted Projections</title>
 <style>
   :root {
-    --bg: #080b11;
-    --dot: #2f3d52;
-    --dot-lit: #46597a;
-    --accent: #ffb454;
-    --accent-soft: rgba(255, 180, 84, 0.18);
-    --text: #7c8ba3;
-    --text-bright: #c6d2e3;
+    --bg: #ffffff;
+    --dot: #111418;
+    --accent: #d4541e;
+    --text: #9aa3ad;
+    --text-bright: #1a1f25;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { height: 100%; overflow: hidden; background: var(--bg); }
@@ -23,28 +21,34 @@
   }
   #map { display: block; width: 100vw; height: 100vh; }
 
-  /* Chrome stays out of the way — the map is the interface. */
+  /* The bar is not a box on the page — it is a line of text that happens to
+     accept typing. No border, no fill, no shadow. */
   #console {
     position: fixed;
     left: 50%;
     transform: translateX(-50%);
-    bottom: max(28px, env(safe-area-inset-bottom));
-    width: min(560px, calc(100vw - 32px));
+    bottom: max(7vh, 44px);
+    width: min(640px, calc(100vw - 48px));
     display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 16px;
-    background: rgba(10, 14, 21, 0.72);
-    border: 1px solid rgba(124, 139, 163, 0.18);
-    border-radius: 2px;
-    backdrop-filter: blur(8px);
+    align-items: baseline;
+    gap: 12px;
+    pointer-events: auto;
   }
   #console::before {
-    content: "›";
-    color: var(--accent);
-    font-size: 14px;
-    line-height: 1;
+    content: "";
+    position: absolute;
+    left: -8%;
+    right: -8%;
+    top: -240%;
+    bottom: -180%;
+    /* Fades the dot field out behind the text so it stays readable without
+       drawing a panel over the map. */
+    background: radial-gradient(ellipse at center,
+      rgba(255,255,255,.97) 0%, rgba(255,255,255,.9) 42%, rgba(255,255,255,0) 74%);
+    pointer-events: none;
+    z-index: -1;
   }
+  #caret { color: var(--accent); font-size: 15px; line-height: 1; opacity: .9; }
   #cmd {
     flex: 1;
     background: none;
@@ -52,34 +56,58 @@
     outline: none;
     color: var(--text-bright);
     font: inherit;
-    font-size: 13px;
-    letter-spacing: 0.02em;
+    font-size: 15px;
+    letter-spacing: .01em;
+    padding: 2px 0;
   }
-  #cmd::placeholder { color: rgba(124, 139, 163, 0.5); }
+  #cmd::placeholder { color: transparent; }
+
+  /* The rotating hint sits under the real input, so the placeholder can
+     animate without fighting the browser's own placeholder rendering. */
+  #hint {
+    position: absolute;
+    left: 27px;
+    bottom: 2px;
+    font-size: 15px;
+    color: #b9c0c8;
+    pointer-events: none;
+    transition: opacity .45s ease, transform .45s ease;
+    white-space: nowrap;
+  }
+  #hint.out { opacity: 0; transform: translateY(-4px); }
+  #rule {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: calc(max(7vh, 44px) - 10px);
+    width: min(640px, calc(100vw - 48px));
+    height: 1px;
+    background: linear-gradient(to right,
+      rgba(0,0,0,0), rgba(0,0,0,.16) 12%, rgba(0,0,0,.16) 88%, rgba(0,0,0,0));
+  }
 
   #status {
     position: fixed;
-    top: max(20px, env(safe-area-inset-top));
+    top: max(22px, env(safe-area-inset-top));
     left: 50%;
     transform: translateX(-50%);
     font-size: 10px;
-    letter-spacing: 0.18em;
+    letter-spacing: .2em;
     text-transform: uppercase;
     color: var(--text);
-    opacity: 0.55;
     pointer-events: none;
     white-space: nowrap;
+    transition: opacity .4s ease;
   }
   #label {
     position: fixed;
     font-size: 10px;
-    letter-spacing: 0.14em;
+    letter-spacing: .14em;
     text-transform: uppercase;
     color: var(--accent);
     pointer-events: none;
     opacity: 0;
     transition: opacity .5s ease;
-    text-shadow: 0 0 12px rgba(0,0,0,.9);
     white-space: nowrap;
   }
   #label.on { opacity: 1; }
@@ -90,10 +118,13 @@
 </head>
 <body>
 <canvas id="map"></canvas>
-<div id="status">loading the map</div>
+<div id="status"></div>
 <div id="label"></div>
+<div id="rule"></div>
 <form id="console" autocomplete="off">
-  <input id="cmd" name="cmd" placeholder="show my location" aria-label="command">
+  <span id="caret">›</span>
+  <input id="cmd" name="cmd" aria-label="type anything">
+  <span id="hint"></span>
 </form>
 
 <script>
@@ -104,32 +135,29 @@
   const ctx = canvas.getContext("2d", { alpha: false });
   const statusEl = document.getElementById("status");
   const labelEl = document.getElementById("label");
+  const hintEl = document.getElementById("hint");
   const form = document.getElementById("console");
   const input = document.getElementById("cmd");
 
   const setStatus = (t, busy) => {
-    statusEl.innerHTML = busy ? `<span class="spin">•</span> ${t}` : t;
+    statusEl.innerHTML = busy ? `<span class="spin">•</span> ${t}` : (t || "");
   };
 
   // ── State ──────────────────────────────────────────────────────────────────
-  let grid = null;      // dots.json
-  let dots = [];        // { lon, lat, country, phase, hx, hy } in grid space
+  let grid = null;
+  let dots = [];
+  let landCells = null;       // Set of "col,row" — used to build the inverse
+  let reversed = false;
   let view = { x: 0, y: 0, w: 1, h: 1, cell: 1 };
-  let marker = null;    // { lon, lat, index, born, label }
-  let morph = null;     // { dir: 1 into shape, -1 back to map, born }
+  let marker = null;
+  let morph = null;
   let dpr = 1;
+  let cssW = 0, cssH = 0;
+  let introTimer = null;
 
   // ── Projection ─────────────────────────────────────────────────────────────
-  // Equirectangular. The grid is cropped in latitude, so the drawn box is
-  // 360deg wide by (latMax-latMin) tall — not the usual 2:1.
-  let cssW = 0, cssH = 0;
-
   function layout() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
-    // Measure the element, not the window: under page zoom the two disagree
-    // (100vw can resolve to 1280 while innerWidth reports 456), and sizing the
-    // drawing from the window then stretches it across a differently-sized
-    // canvas.
     const rect = canvas.getBoundingClientRect();
     const w = Math.max(1, Math.round(rect.width));
     const h = Math.max(1, Math.round(rect.height));
@@ -141,11 +169,13 @@
     if (!grid) return;
     const spanLon = 360, spanLat = grid.latMax - grid.latMin;
     const aspect = spanLon / spanLat;
-    // Fill the viewport while keeping geography undistorted.
-    const pad = 0.945;
+    const pad = 0.94;
     let vw = w * pad, vh = vw / aspect;
     if (vh > h * pad) { vh = h * pad; vw = vh * aspect; }
-    view = { x: (w - vw) / 2, y: (h - vh) / 2, w: vw, h: vh, cell: vw / (spanLon / grid.step) };
+    view = {
+      x: (w - vw) / 2, y: (h - vh) / 2, w: vw, h: vh,
+      cell: vw / (spanLon / grid.step),
+    };
   }
 
   const project = (lon, lat) => ({
@@ -154,32 +184,52 @@
   });
 
   // ── Data ───────────────────────────────────────────────────────────────────
+  function makeDot(col, row, countryId) {
+    const lon = grid.lonMin + col * grid.step;
+    const lat = grid.latMax - row * grid.step;
+    return {
+      lon, lat, country: countryId,
+      phase: (Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453) % (Math.PI * 2),
+      tgx: null, tgy: null,
+    };
+  }
+
+  function buildDots() {
+    if (!reversed) {
+      dots = new Array(grid.count);
+      for (let i = 0; i < grid.count; i++) {
+        dots[i] = makeDot(grid.cols[i], grid.rows[i], grid.countryIds[i]);
+      }
+      return;
+    }
+    // Reverse: the sea becomes the dots and the land becomes the hole, so the
+    // same continents read as negative space.
+    const out = [];
+    for (let r = 0; r < grid.nRows; r++) {
+      for (let c = 0; c < grid.nCols; c++) {
+        if (!landCells.has(c + "," + r)) out.push(makeDot(c, r, -1));
+      }
+    }
+    dots = out;
+  }
+
   async function loadGrid() {
     const res = await fetch("dots.json");
     if (!res.ok) throw new Error("dots.json " + res.status);
     grid = await res.json();
-
-    dots = new Array(grid.count);
+    landCells = new Set();
     for (let i = 0; i < grid.count; i++) {
-      const lon = grid.lonMin + grid.cols[i] * grid.step;
-      const lat = grid.latMax - grid.rows[i] * grid.step;
-      dots[i] = {
-        lon, lat,
-        country: grid.countryIds[i],
-        // Deterministic per-dot phase so the drift looks organic, not uniform.
-        phase: (Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453) % (Math.PI * 2),
-      };
+      landCells.add(grid.cols[i] + "," + grid.rows[i]);
     }
+    buildDots();
     layout();
   }
 
   function nearestDot(lon, lat) {
-    // Longitude wraps; compare on the short way round.
     let best = -1, bestD = Infinity;
     for (let i = 0; i < dots.length; i++) {
       let dLon = Math.abs(dots[i].lon - lon);
       if (dLon > 180) dLon = 360 - dLon;
-      // Degrees of longitude shrink toward the poles.
       const dx = dLon * Math.cos((lat * Math.PI) / 180);
       const dy = dots[i].lat - lat;
       const d = dx * dx + dy * dy;
@@ -189,24 +239,19 @@
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
-  // Drift scales with the dot pitch: a fixed pixel wander is invisible on a
-  // coarse grid and jittery on a fine one.
-  const DRIFT_RATIO = 0.045;
+  const DRIFT_RATIO = 0.05;
   const MORPH_SECONDS = 1.15;
+  const DOT_RATIO = 0.30;      // radius as a share of pitch
 
   function draw(now) {
     const t = now / 1000;
-    const w = cssW, h = cssH;
-
     ctx.fillStyle = getVar("--bg");
-    ctx.fillRect(0, 0, w, h);
+    ctx.fillRect(0, 0, cssW, cssH);
 
     if (grid) {
-      // Reference image has dots very nearly touching: diameter ~0.8 of pitch.
-      const r = Math.max(0.7, view.cell * 0.40);
+      const r = Math.max(0.6, view.cell * DOT_RATIO);
       const drift = view.cell * DRIFT_RATIO;
 
-      // Morph progress: 0 = map, 1 = shape. Eased both ways.
       let m = 0;
       if (morph) {
         const raw = Math.min(1, (t - morph.born) / MORPH_SECONDS);
@@ -215,30 +260,25 @@
         if (raw >= 1 && morph.dir === -1) morph = null;
       }
 
-      // Two paths: dots that belong to the shape, and dots left over. Leftovers
-      // fade rather than piling up somewhere arbitrary.
       const path = new Path2D();
       const spare = new Path2D();
       for (let i = 0; i < dots.length; i++) {
         const d = dots[i];
         const p = project(d.lon, d.lat);
-        const wob = Math.sin(t * 0.55 + d.phase) * drift;
-        const wob2 = Math.cos(t * 0.41 + d.phase * 1.7) * drift;
-        let x = p.x + wob, y = p.y + wob2;
-
-        const inShape = m > 0 && d.tgx != null;
-        if (inShape) {
+        let x = p.x + Math.sin(t * 0.55 + d.phase) * drift;
+        let y = p.y + Math.cos(t * 0.41 + d.phase * 1.7) * drift;
+        if (m > 0 && d.tgx != null) {
           x += (view.x + d.tgx * view.w - x) * m;
           y += (view.y + d.tgy * view.h - y) * m;
         }
-        const target = (m > 0 && d.tgx == null) ? spare : path;
-        target.moveTo(x + r, y);
-        target.arc(x, y, r, 0, Math.PI * 2);
+        const into = (m > 0 && d.tgx == null) ? spare : path;
+        into.moveTo(x + r, y);
+        into.arc(x, y, r, 0, Math.PI * 2);
       }
       ctx.fillStyle = getVar("--dot");
       ctx.fill(path);
       if (m > 0) {
-        ctx.globalAlpha = 1 - m * 0.88;
+        ctx.globalAlpha = Math.max(0, 1 - m * 1.6);   // leftovers clear out fully
         ctx.fill(spare);
         ctx.globalAlpha = 1;
       }
@@ -252,11 +292,7 @@
     const d = dots[marker.index];
     if (!d) return;
     const p = project(d.lon, d.lat);
-
-    // One dot, lit — same size as every other. Growing it or glowing its
-    // neighbours makes the marked place look physically bigger than it is,
-    // which on a map is a lie about area.
-    const pulse = 0.72 + 0.28 * Math.sin((t - marker.born) * 3.0);
+    const pulse = 0.7 + 0.3 * Math.sin((t - marker.born) * 3.0);
     ctx.beginPath();
     ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.globalAlpha = pulse;
@@ -282,11 +318,6 @@
   }
 
   // ── Shapes ─────────────────────────────────────────────────────────────────
-  // The dots rearrange into a shape by sampling a glyph rendered offscreen at
-  // the grid's own resolution. An emoji gives a real silhouette for a common
-  // noun; anything without one falls back to spelling the word, which always
-  // works. No drawing model is involved — a 0.5B model cannot draw a dog, but
-  // the font on the machine already knows what one looks like.
   const EMOJI = {
     dog:"🐕", cat:"🐈", heart:"❤️", star:"⭐", tree:"🌳", fish:"🐟", bird:"🐦",
     house:"🏠", home:"🏠", car:"🚗", plane:"✈️", rocket:"🚀", boat:"⛵",
@@ -300,33 +331,34 @@
     whale:"🐳", turtle:"🐢", snake:"🐍", horse:"🐴", cow:"🐄", pig:"🐖",
     bear:"🐻", panda:"🐼", monkey:"🐒", elephant:"🐘", butterfly:"🦋",
     spider:"🕷️", bee:"🐝", crab:"🦀", octopus:"🐙", penguin:"🐧",
+    wow:"😮", smile:"🙂", sad:"🙁", love:"💖", peace:"✌️", ok:"👌",
+    thumbsup:"👍", wave:"👋", eyes:"👀", zap:"⚡", tea:"🍵", sushi:"🍣",
+    burger:"🍔", icecream:"🍦", guitar:"🎸", football:"⚽", chess:"♟️",
+    dice:"🎲", trophy:"🏆", medal:"🏅", rainbow:"🌈", wave2:"🌊", volcano:"🌋",
+    mountain:"⛰️", cactus:"🌵", mushroom:"🍄", ghost2:"👾", magnet:"🧲",
   };
 
-  /**
-   * Rasterise a glyph and return the cells it covers, in normalised view space.
-   * Sampling at the grid's own resolution keeps the result on the same lattice
-   * as the map, so the transition reads as the same dots moving.
-   */
-  function glyphTargets(text, { cols = grid.nCols, rows = grid.nRows } = {}) {
-    const S = 8;                       // supersample per cell, for a clean edge
+  function glyphTargets(text) {
+    const cols = grid.nCols, rows = grid.nRows;
+    const S = 6;
     const off = document.createElement("canvas");
     off.width = cols * S;
     off.height = rows * S;
     const octx = off.getContext("2d", { willReadFrequently: true });
     octx.fillStyle = "#000";
     octx.fillRect(0, 0, off.width, off.height);
-
     octx.fillStyle = "#fff";
     octx.textAlign = "center";
     octx.textBaseline = "middle";
 
-    // Grow the type until it fills the frame, then draw once.
-    let size = off.height * 0.9;
-    octx.font = `900 ${size}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",ui-monospace,monospace`;
+    let size = off.height * 0.86;
+    const font = (s) =>
+      `900 ${s}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",ui-monospace,monospace`;
+    octx.font = font(size);
     const w = octx.measureText(text).width;
-    if (w > off.width * 0.92) {
-      size = size * (off.width * 0.92) / w;
-      octx.font = `900 ${size}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",ui-monospace,monospace`;
+    if (w > off.width * 0.9) {
+      size = size * (off.width * 0.9) / w;
+      octx.font = font(size);
     }
     octx.fillText(text, off.width / 2, off.height / 2);
 
@@ -335,31 +367,38 @@
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         let lit = 0;
-        for (let sy = 0; sy < S; sy += 2) {
-          for (let sx = 0; sx < S; sx += 2) {
-            const px = (c * S + sx), py = (r * S + sy);
-            const i = (py * off.width + px) * 4;
-            // Any channel: emoji are colour, text is white.
-            if (data[i] > 90 || data[i + 1] > 90 || data[i + 2] > 90) lit++;
+        for (let sy = 1; sy < S; sy += 2) {
+          for (let sx = 1; sx < S; sx += 2) {
+            const i = ((r * S + sy) * off.width + (c * S + sx)) * 4;
+            if (data[i] > 80 || data[i + 1] > 80 || data[i + 2] > 80) lit++;
           }
         }
-        if (lit >= 3) targets.push({ gx: (c + 0.5) / cols, gy: (r + 0.5) / rows });
+        if (lit >= 2) targets.push({ gx: (c + 0.5) / cols, gy: (r + 0.5) / rows });
       }
     }
     return targets;
   }
 
-  /** Give each target the nearest still-unclaimed dot, so paths do not cross. */
   function assignTargets(targets) {
     for (const d of dots) { d.tgx = null; d.tgy = null; }
+
+    // Each target claims its nearest still-free dot. Rank-order assignment
+    // (sort both sides, pair them off) is cheaper but smears the glyph: the
+    // dots are distributed like continents and the targets like letters, so
+    // matching them by rank stretches one onto the other.
+    const hx = new Float32Array(dots.length);
+    const hy = new Float32Array(dots.length);
+    for (let i = 0; i < dots.length; i++) {
+      hx[i] = (dots[i].lon + 180) / 360;
+      hy[i] = (grid.latMax - dots[i].lat) / (grid.latMax - grid.latMin);
+    }
     const used = new Uint8Array(dots.length);
+    let placed = 0;
     for (const t of targets) {
       let best = -1, bestD = Infinity;
       for (let i = 0; i < dots.length; i++) {
         if (used[i]) continue;
-        const hx = (dots[i].lon + 180) / 360;
-        const hy = (grid.latMax - dots[i].lat) / (grid.latMax - grid.latMin);
-        const dx = hx - t.gx, dy = hy - t.gy;
+        const dx = hx[i] - t.gx, dy = hy[i] - t.gy;
         const v = dx * dx + dy * dy;
         if (v < bestD) { bestD = v; best = i; }
       }
@@ -367,29 +406,66 @@
       used[best] = 1;
       dots[best].tgx = t.gx;
       dots[best].tgy = t.gy;
+      placed++;
     }
-    return targets.length;
+    return placed;
   }
 
-  function doShape(word) {
-    const clean = (word || "").trim().toLowerCase();
-    if (!clean) return;
-    const glyph = EMOJI[clean] || EMOJI[clean.replace(/s$/, "")];
-    const targets = glyphTargets(glyph || clean.toUpperCase().slice(0, 10));
-    if (!targets.length) { setStatus("cannot draw that"); return; }
+  function showGlyph(text, label) {
+    const targets = glyphTargets(text);
+    if (!targets.length) return false;
     assignTargets(targets);
     morph = { dir: 1, born: performance.now() / 1000 };
     marker = null;
     labelEl.classList.remove("on");
-    setStatus(glyph ? `${clean} ${glyph}` : clean);
+    if (label !== undefined) setStatus(label);
+    return true;
+  }
+
+  function doShape(word) {
+    const clean = (word || "").trim();
+    if (!clean) return;
+    const key = clean.toLowerCase().replace(/[^a-z]/g, "");
+    const glyph = EMOJI[key] || EMOJI[key.replace(/s$/, "")];
+    // Every word draws something: its emoji if it has one, otherwise itself.
+    showGlyph(glyph || clean.toUpperCase().slice(0, 12),
+              glyph ? `${clean} ${glyph}` : clean);
   }
 
   function releaseShape() {
     if (morph && morph.dir === 1) morph = { dir: -1, born: performance.now() / 1000 };
   }
 
+  // ── Chat: the reply is spelled out, one word at a time ──────────────────────
+  let sayTimer = null;
+  function sayWords(reply) {
+    clearTimeout(sayTimer);
+    const words = String(reply || "").split(/\s+/).filter(Boolean);
+    if (!words.length) { setStatus("nothing to say"); return; }
+    let k = 0;
+    const step = () => {
+      if (k >= words.length) {
+        sayTimer = setTimeout(() => { releaseShape(); setStatus(""); }, 1400);
+        return;
+      }
+      showGlyph(words[k], reply);
+      k++;
+      sayTimer = setTimeout(step, 1500);
+    };
+    step();
+  }
+
+  // ── Reverse ────────────────────────────────────────────────────────────────
+  function toggleReverse() {
+    reversed = !reversed;
+    morph = null;
+    marker = null;
+    labelEl.classList.remove("on");
+    buildDots();
+    setStatus(reversed ? "reversed — the sea is the ink now" : "");
+  }
+
   // ── Intents ────────────────────────────────────────────────────────────────
-  // The director only ever emits one of these. All motion is client-side.
   function applyIntent(intent) {
     if (!intent || !intent.intent) return;
     switch (intent.intent) {
@@ -398,6 +474,11 @@
         return doLocate(intent.params || {});
       case "shape":
         return doShape((intent.params || {}).word);
+      case "chat":
+        return sayWords((intent.params || {}).reply);
+      case "reverse":
+        releaseShape();
+        return toggleReverse();
       case "idle":
       default:
         marker = null;
@@ -411,8 +492,9 @@
     const index = nearestDot(lon, lat);
     if (index < 0) { setStatus("no land near there"); return; }
     marker = { index, born: performance.now() / 1000, label };
-    const country = grid.countries[dots[index].country];
-    setStatus(label || (country ? country.name : "located"));
+    const id = dots[index].country;
+    const country = id >= 0 && grid.countries[id] ? grid.countries[id].name : null;
+    setStatus(label || country || "found it");
   }
 
   async function doLocate(params) {
@@ -421,8 +503,6 @@
       return;
     }
     setStatus("finding you", true);
-
-    // Browser geolocation first; it is the accurate one and needs consent.
     const viaBrowser = await new Promise((resolve) => {
       if (!navigator.geolocation) return resolve(null);
       navigator.geolocation.getCurrentPosition(
@@ -432,22 +512,17 @@
       );
     });
     if (viaBrowser) { markAt(viaBrowser.lon, viaBrowser.lat, "you"); return; }
-
-    // Denied or unavailable — fall back to IP geolocation via the backend,
-    // which keeps the third-party call off the page's origin.
     try {
       const res = await fetch("/api/whereami");
       const d = await res.json();
-      if (typeof d.lat === "number") {
-        markAt(d.lon, d.lat, d.city || "approx");
-        return;
-      }
+      if (typeof d.lat === "number") { markAt(d.lon, d.lat, d.city || "about here"); return; }
     } catch (_) { /* fall through */ }
     setStatus("couldn’t work out where you are");
   }
 
   // ── Director ───────────────────────────────────────────────────────────────
   async function send(text) {
+    stopIntro();
     setStatus("reading that", true);
     try {
       const res = await fetch("/api/intent", {
@@ -467,21 +542,75 @@
     const text = input.value.trim();
     if (!text) return;
     input.value = "";
+    updateHint();
     send(text);
   });
 
-  // ResizeObserver catches zoom and container changes that resize events miss.
+  // ── Hints ──────────────────────────────────────────────────────────────────
+  const HINTS = [
+    "show my location", "draw a dog", "draw a cat", "talk to me",
+    "reverse", "spell your name", "a rocket", "51.5, -0.12",
+  ];
+  let hintIndex = 0;
+  function updateHint() {
+    hintEl.textContent = input.value ? "" : HINTS[hintIndex % HINTS.length];
+  }
+  function cycleHint() {
+    if (input.value) return;
+    hintEl.classList.add("out");
+    setTimeout(() => {
+      hintIndex++;
+      updateHint();
+      hintEl.classList.remove("out");
+    }, 450);
+  }
+  input.addEventListener("input", updateHint);
+  setInterval(cycleHint, 3800);
+
+  // ── Intro: hello, going round the world ────────────────────────────────────
+  const GREETINGS = [
+    ["HELLO", "english"], ["NAMASTE", "hindi"], ["CIAO", "italian"],
+    ["HOLA", "spanish"], ["BONJOUR", "french"], ["HALLO", "german"],
+    ["OLA", "portuguese"], ["PRIVET", "russian"], ["NI HAO", "chinese"],
+    ["KONNICHIWA", "japanese"], ["ANNYEONG", "korean"], ["HEJ", "swedish"],
+    ["JAMBO", "swahili"], ["ALOHA", "hawaiian"], ["KIA ORA", "maori"],
+    ["SAWASDEE", "thai"], ["ZDRAVO", "croatian"], ["AHOJ", "czech"],
+    ["SZIA", "hungarian"], ["XIN CHAO", "vietnamese"],
+  ];
+
+  function startIntro() {
+    let k = 0;
+    const order = GREETINGS.slice().sort(() => Math.random() - 0.5);
+    const step = () => {
+      if (k >= 5) {           // five hellos, then settle into the map
+        releaseShape();
+        setStatus("");
+        introTimer = null;
+        return;
+      }
+      const [word, lang] = order[k];
+      showGlyph(word, `${word.toLowerCase()} · ${lang}`);
+      k++;
+      introTimer = setTimeout(step, 1700);
+    };
+    step();
+  }
+
+  function stopIntro() {
+    if (introTimer) { clearTimeout(introTimer); introTimer = null; }
+    clearTimeout(sayTimer);
+  }
+
   new ResizeObserver(layout).observe(canvas);
   window.addEventListener("resize", layout);
 
-  // ── Boot ───────────────────────────────────────────────────────────────────
   loadGrid()
     .then(() => {
-      setStatus(`${grid.count} dots, one per ${grid.step}° of the real world`);
       requestAnimationFrame(draw);
-      setTimeout(() => setStatus(""), 4000);
+      updateHint();
+      setTimeout(startIntro, 500);
     })
-    .catch((err) => setStatus("the map did not load"));
+    .catch(() => setStatus("the map did not load"));
 })();
 </script>
 </body>
