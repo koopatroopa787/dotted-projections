@@ -188,7 +188,9 @@
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
-  const DRIFT = 0.30;   // px, peak displacement of the idle wander
+  // Drift scales with the dot pitch: a fixed pixel wander is invisible on a
+  // coarse grid and jittery on a fine one.
+  const DRIFT_RATIO = 0.045;
 
   function draw(now) {
     const t = now / 1000;
@@ -198,7 +200,9 @@
     ctx.fillRect(0, 0, w, h);
 
     if (grid) {
-      const r = Math.max(0.7, view.cell * 0.30);
+      // Reference image has dots very nearly touching: diameter ~0.8 of pitch.
+      const r = Math.max(0.7, view.cell * 0.40);
+      const drift = view.cell * DRIFT_RATIO;
 
       // One path for every base dot, filled once — 10k individual fill calls
       // would not hold 60fps, one fill of 10k subpaths does.
@@ -206,8 +210,8 @@
       for (let i = 0; i < dots.length; i++) {
         const d = dots[i];
         const p = project(d.lon, d.lat);
-        const wob = Math.sin(t * 0.55 + d.phase) * DRIFT;
-        const wob2 = Math.cos(t * 0.41 + d.phase * 1.7) * DRIFT;
+        const wob = Math.sin(t * 0.55 + d.phase) * drift;
+        const wob2 = Math.cos(t * 0.41 + d.phase * 1.7) * drift;
         path.moveTo(p.x + wob + r, p.y + wob2);
         path.arc(p.x + wob, p.y + wob2, r, 0, Math.PI * 2);
       }

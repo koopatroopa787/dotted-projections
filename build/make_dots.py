@@ -26,7 +26,7 @@ OUTPUT = ROOT / "frontend" / "dots.json"
 # Set to -90.0 to include it.
 LAT_MIN = -56.0
 LAT_MAX = 84.0
-DEFAULT_STEP = 1.2
+DEFAULT_STEP = 6.0
 
 
 def rings_of(geometry):
@@ -72,6 +72,25 @@ def point_in_polygon(x, y, polygon):
     return inside
 
 
+# Sub-samples per axis within a cell. 3 means the centre plus a 3x3 lattice,
+# which is enough to catch an island a few hundred km across at a 6-degree step
+# without meaningfully fattening continental coastlines.
+SUBSAMPLE = 3
+
+
+def cell_samples(lat, lon, step):
+    """Centre first (most cells resolve there), then a lattice across the cell."""
+    yield lat, lon
+    half = step / 2.0
+    for i in range(SUBSAMPLE):
+        for j in range(SUBSAMPLE):
+            dy = -half + (i + 0.5) * (step / SUBSAMPLE)
+            dx = -half + (j + 0.5) * (step / SUBSAMPLE)
+            if dy == 0 and dx == 0:
+                continue
+            yield lat + dy, lon + dx
+
+
 def load_countries():
     data = json.loads(SOURCE.read_text(encoding="utf-8"))
     entries = []
@@ -105,13 +124,21 @@ def build(step: float):
             continue
         for col in range(n_cols):
             lon = -180.0 + col * step
+            # A dot means "there is land in this cell", not "there is land at
+            # this exact point". Centre-sampling at the reference's spacing
+            # drops the UK, Ireland, Cuba and Japan entirely — features the
+            # reference clearly shows — because a 6-degree cell can straddle a
+            # small island without its centre touching land.
             hit = None
-            for c in band:
-                x0, _, x1, _ = c["bbox"]
-                if lon < x0 or lon > x1:
-                    continue
-                if point_in_polygon(lon, lat, c["polygon"]):
-                    hit = c
+            for sub_lat, sub_lon in cell_samples(lat, lon, step):
+                for c in band:
+                    x0, y0, x1, y1 = c["bbox"]
+                    if sub_lon < x0 or sub_lon > x1 or sub_lat < y0 or sub_lat > y1:
+                        continue
+                    if point_in_polygon(sub_lon, sub_lat, c["polygon"]):
+                        hit = c
+                        break
+                if hit is not None:
                     break
             if hit is None:
                 continue
