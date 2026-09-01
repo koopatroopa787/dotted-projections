@@ -12,7 +12,7 @@ Run: uvicorn server:app --host 127.0.0.1 --port 8020
 import json
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
 
 import httpx
 from fastapi import FastAPI, Request
@@ -52,12 +52,15 @@ CHAT_HINTS = re.compile(
 )
 
 # The dots spell the reply one word at a time, so a long answer is unreadable.
-CHAT_MAX_CHARS = 34
+CHAT_MAX_CHARS = 78
+# Enough for the reply to follow the thread; more than this and a 0.5B
+# model starts losing the plot rather than gaining context.
+CHAT_HISTORY_TURNS = 4
 CHAT_PROMPT = (
-    "You are the voice of a dot-matrix world map. Reply with ONE complete "
-    "thought of five words or fewer. It must stand on its own and never "
-    "trail off mid-sentence. No punctuation, no emoji, no quotes. "
-    "Good replies: I AM LISTENING / THE WORLD IS QUIET / ASK ME ANYTHING"
+    "You are the voice of a dot-matrix world map. Answer in ONE finished "
+    "sentence of ten words or fewer. Never stop mid-sentence. Plain words, "
+    "no punctuation, no emoji, no quotes. "
+    "Good: I AM LISTENING TO YOU / THE WORLD IS QUIET TONIGHT"
 )
 
 
@@ -81,6 +84,9 @@ IP_PROVIDERS = [
 
 class Command(BaseModel):
     text: str
+    # Prior turns, oldest first, as {"you": ..., "map": ...}. The server
+    # keeps no state: whoever is talking carries their own thread.
+    history: List[Dict[str, str]] = []
 
 
 def _fallback(text: str) -> Dict[str, Any]:
@@ -147,7 +153,7 @@ async def classify(cmd: Command):
     decision = _fallback(text)
 
     if decision["intent"] == "chat":
-        reply = await _chat_reply(text)
+        reply = await _chat_reply(text, cmd.history or [])
         return JSONResponse({
             "intent": "chat",
             "params": {"reply": reply},
@@ -157,16 +163,21 @@ async def classify(cmd: Command):
     return JSONResponse({**decision, "via": "rule"})
 
 
-async def _chat_reply(text: str) -> str:
+async def _chat_reply(text: str, history: List[Dict[str, str]]) -> str:
     """A few words back, or empty if the model is unavailable."""
+    messages = [{"role": "system", "content": CHAT_PROMPT}]
+    for turn in history[-CHAT_HISTORY_TURNS:]:
+        if turn.get("you"):
+            messages.append({"role": "user", "content": str(turn["you"])[:200]})
+        if turn.get("map"):
+            messages.append({"role": "assistant", "content": str(turn["map"])[:60]})
+    messages.append({"role": "user", "content": text})
+
     payload = {
         "model": MODEL,
         "stream": False,
         "options": {"temperature": 0.7, "num_predict": 24},
-        "messages": [
-            {"role": "system", "content": CHAT_PROMPT},
-            {"role": "user", "content": text},
-        ],
+        "messages": messages,
     }
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -181,7 +192,7 @@ async def _chat_reply(text: str) -> str:
     # mid-sentence reads worse than a short one, so trim on a word boundary.
     # Whole words only. Slicing the joined string by character count cut
     # "WHENEVER" to "WHENEVE", and a dot-drawn half-word just looks broken.
-    words = re.findall(r"[A-Za-z0-9']+", raw)[:5]
+    words = re.findall(r"[A-Za-z0-9']+", raw)[:12]
     out, used = [], 0
     for w in words:
         if used + len(w) + (1 if out else 0) > CHAT_MAX_CHARS:

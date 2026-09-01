@@ -8,7 +8,7 @@
   :root {
     --bg: #ffffff;
     --dot: #111418;
-    --accent: #d4541e;
+    --accent: #e0210f;
     --text: #9aa3ad;
     --text-bright: #1a1f25;
   }
@@ -21,8 +21,6 @@
   }
   #map { display: block; width: 100vw; height: 100vh; }
 
-  /* The bar is not a box on the page — it is a line of text that happens to
-     accept typing. No border, no fill, no shadow. */
   #console {
     position: fixed;
     left: 50%;
@@ -32,17 +30,11 @@
     display: flex;
     align-items: baseline;
     gap: 12px;
-    pointer-events: auto;
   }
   #console::before {
     content: "";
     position: absolute;
-    left: -8%;
-    right: -8%;
-    top: -240%;
-    bottom: -180%;
-    /* Fades the dot field out behind the text so it stays readable without
-       drawing a panel over the map. */
+    left: -8%; right: -8%; top: -240%; bottom: -180%;
     background: radial-gradient(ellipse at center,
       rgba(255,255,255,.97) 0%, rgba(255,255,255,.9) 42%, rgba(255,255,255,0) 74%);
     pointer-events: none;
@@ -50,65 +42,41 @@
   }
   #caret { color: var(--accent); font-size: 15px; line-height: 1; opacity: .9; }
   #cmd {
-    flex: 1;
-    background: none;
-    border: none;
-    outline: none;
-    color: var(--text-bright);
-    font: inherit;
-    font-size: 15px;
-    letter-spacing: .01em;
-    padding: 2px 0;
+    flex: 1; background: none; border: none; outline: none;
+    color: var(--text-bright); font: inherit; font-size: 15px; padding: 2px 0;
   }
-  #cmd::placeholder { color: transparent; }
-
-  /* The rotating hint sits under the real input, so the placeholder can
-     animate without fighting the browser's own placeholder rendering. */
   #hint {
-    position: absolute;
-    left: 27px;
-    bottom: 2px;
-    font-size: 15px;
-    color: #b9c0c8;
-    pointer-events: none;
+    position: absolute; left: 27px; bottom: 2px;
+    font-size: 15px; color: #b9c0c8; pointer-events: none; white-space: nowrap;
     transition: opacity .45s ease, transform .45s ease;
-    white-space: nowrap;
   }
   #hint.out { opacity: 0; transform: translateY(-4px); }
   #rule {
-    position: fixed;
-    left: 50%;
-    transform: translateX(-50%);
+    position: fixed; left: 50%; transform: translateX(-50%);
     bottom: calc(max(7vh, 44px) - 10px);
-    width: min(640px, calc(100vw - 48px));
-    height: 1px;
+    width: min(640px, calc(100vw - 48px)); height: 1px;
     background: linear-gradient(to right,
       rgba(0,0,0,0), rgba(0,0,0,.16) 12%, rgba(0,0,0,.16) 88%, rgba(0,0,0,0));
   }
 
   #status {
-    position: fixed;
-    top: max(22px, env(safe-area-inset-top));
-    left: 50%;
+    position: fixed; top: max(22px, env(safe-area-inset-top)); left: 50%;
     transform: translateX(-50%);
-    font-size: 10px;
-    letter-spacing: .2em;
-    text-transform: uppercase;
-    color: var(--text);
-    pointer-events: none;
-    white-space: nowrap;
-    transition: opacity .4s ease;
+    font-size: 10px; letter-spacing: .2em; text-transform: uppercase;
+    color: var(--text); pointer-events: none; white-space: nowrap;
   }
+
+  /* Solid pill so the label reads over a dense dot field instead of
+     disappearing into it. */
   #label {
     position: fixed;
-    font-size: 10px;
-    letter-spacing: .14em;
-    text-transform: uppercase;
-    color: var(--accent);
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity .5s ease;
+    font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: #fff; background: var(--accent);
+    padding: 4px 9px; border-radius: 2px;
+    pointer-events: none; opacity: 0;
+    transition: opacity .4s ease;
     white-space: nowrap;
+    box-shadow: 0 1px 10px rgba(0,0,0,.22);
   }
   #label.on { opacity: 1; }
   .spin { display: inline-block; animation: blink 1.2s steps(2) infinite; }
@@ -146,14 +114,20 @@
   // ── State ──────────────────────────────────────────────────────────────────
   let grid = null;
   let dots = [];
-  let landCells = null;       // Set of "col,row" — used to build the inverse
+  let landCells = null;
   let reversed = false;
   let view = { x: 0, y: 0, w: 1, h: 1, cell: 1 };
   let marker = null;
-  let morph = null;
-  let dpr = 1;
-  let cssW = 0, cssH = 0;
-  let introTimer = null;
+  let dpr = 1, cssW = 0, cssH = 0;
+
+  // Every dot interpolates from where it currently IS to where it is going.
+  // Animating from the map each time is what made the world flash back between
+  // one greeting and the next.
+  let morphStart = -1;
+  const MORPH_SECONDS = 1.05;
+
+  let introTimer = null, chatTimer = null;
+  let chatLines = [];
 
   // ── Projection ─────────────────────────────────────────────────────────────
   function layout() {
@@ -167,50 +141,49 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     if (!grid) return;
-    const spanLon = 360, spanLat = grid.latMax - grid.latMin;
-    const aspect = spanLon / spanLat;
+    const spanLat = grid.latMax - grid.latMin;
+    const aspect = 360 / spanLat;
     const pad = 0.94;
     let vw = w * pad, vh = vw / aspect;
     if (vh > h * pad) { vh = h * pad; vw = vh * aspect; }
-    view = {
-      x: (w - vw) / 2, y: (h - vh) / 2, w: vw, h: vh,
-      cell: vw / (spanLon / grid.step),
-    };
+    view = { x: (w - vw) / 2, y: (h - vh) / 2, w: vw, h: vh,
+             cell: vw / (360 / grid.step) };
   }
 
-  const project = (lon, lat) => ({
-    x: view.x + ((lon + 180) / 360) * view.w,
-    y: view.y + ((grid.latMax - lat) / (grid.latMax - grid.latMin)) * view.h,
-  });
+  const sx = (gx) => view.x + gx * view.w;
+  const sy = (gy) => view.y + gy * view.h;
 
   // ── Data ───────────────────────────────────────────────────────────────────
   function makeDot(col, row, countryId) {
     const lon = grid.lonMin + col * grid.step;
     const lat = grid.latMax - row * grid.step;
+    const hx = (lon + 180) / 360;
+    const hy = (grid.latMax - lat) / (grid.latMax - grid.latMin);
     return {
-      lon, lat, country: countryId,
+      lon, lat, country: countryId, hx, hy,
+      fx: hx, fy: hy, tx: hx, ty: hy,     // from / to, normalised
+      cx: hx, cy: hy,                     // where it is right now
+      active: true,
       phase: (Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453) % (Math.PI * 2),
-      tgx: null, tgy: null,
     };
   }
 
   function buildDots() {
-    if (!reversed) {
-      dots = new Array(grid.count);
-      for (let i = 0; i < grid.count; i++) {
-        dots[i] = makeDot(grid.cols[i], grid.rows[i], grid.countryIds[i]);
-      }
-      return;
-    }
-    // Reverse: the sea becomes the dots and the land becomes the hole, so the
-    // same continents read as negative space.
     const out = [];
-    for (let r = 0; r < grid.nRows; r++) {
-      for (let c = 0; c < grid.nCols; c++) {
-        if (!landCells.has(c + "," + r)) out.push(makeDot(c, r, -1));
+    if (!reversed) {
+      for (let i = 0; i < grid.count; i++) {
+        out.push(makeDot(grid.cols[i], grid.rows[i], grid.countryIds[i]));
+      }
+    } else {
+      // The sea becomes the ink and the land becomes the hole.
+      for (let r = 0; r < grid.nRows; r++) {
+        for (let c = 0; c < grid.nCols; c++) {
+          if (!landCells.has(c + "," + r)) out.push(makeDot(c, r, -1));
+        }
       }
     }
     dots = out;
+    morphStart = -1;
   }
 
   async function loadGrid() {
@@ -218,9 +191,7 @@
     if (!res.ok) throw new Error("dots.json " + res.status);
     grid = await res.json();
     landCells = new Set();
-    for (let i = 0; i < grid.count; i++) {
-      landCells.add(grid.cols[i] + "," + grid.rows[i]);
-    }
+    for (let i = 0; i < grid.count; i++) landCells.add(grid.cols[i] + "," + grid.rows[i]);
     buildDots();
     layout();
   }
@@ -240,8 +211,7 @@
 
   // ── Render ─────────────────────────────────────────────────────────────────
   const DRIFT_RATIO = 0.05;
-  const MORPH_SECONDS = 1.15;
-  const DOT_RATIO = 0.30;      // radius as a share of pitch
+  const DOT_RATIO = 0.30;
 
   function draw(now) {
     const t = now / 1000;
@@ -252,34 +222,30 @@
       const r = Math.max(0.6, view.cell * DOT_RATIO);
       const drift = view.cell * DRIFT_RATIO;
 
-      let m = 0;
-      if (morph) {
-        const raw = Math.min(1, (t - morph.born) / MORPH_SECONDS);
-        const eased = raw < 0.5 ? 4 * raw ** 3 : 1 - (-2 * raw + 2) ** 3 / 2;
-        m = morph.dir === 1 ? eased : 1 - eased;
-        if (raw >= 1 && morph.dir === -1) morph = null;
+      let p = 1;
+      if (morphStart >= 0) {
+        const raw = Math.min(1, (t - morphStart) / MORPH_SECONDS);
+        p = raw < 0.5 ? 4 * raw ** 3 : 1 - (-2 * raw + 2) ** 3 / 2;
       }
 
-      const path = new Path2D();
-      const spare = new Path2D();
+      const solid = new Path2D();
+      const fading = new Path2D();
       for (let i = 0; i < dots.length; i++) {
         const d = dots[i];
-        const p = project(d.lon, d.lat);
-        let x = p.x + Math.sin(t * 0.55 + d.phase) * drift;
-        let y = p.y + Math.cos(t * 0.41 + d.phase * 1.7) * drift;
-        if (m > 0 && d.tgx != null) {
-          x += (view.x + d.tgx * view.w - x) * m;
-          y += (view.y + d.tgy * view.h - y) * m;
-        }
-        const into = (m > 0 && d.tgx == null) ? spare : path;
+        d.cx = d.fx + (d.tx - d.fx) * p;
+        d.cy = d.fy + (d.ty - d.fy) * p;
+        const x = sx(d.cx) + Math.sin(t * 0.55 + d.phase) * drift;
+        const y = sy(d.cy) + Math.cos(t * 0.41 + d.phase * 1.7) * drift;
+        const into = d.active ? solid : fading;
         into.moveTo(x + r, y);
         into.arc(x, y, r, 0, Math.PI * 2);
       }
       ctx.fillStyle = getVar("--dot");
-      ctx.fill(path);
-      if (m > 0) {
-        ctx.globalAlpha = Math.max(0, 1 - m * 1.6);   // leftovers clear out fully
-        ctx.fill(spare);
+      ctx.fill(solid);
+      const spareAlpha = Math.max(0, 1 - p * 1.7);
+      if (spareAlpha > 0.01) {
+        ctx.globalAlpha = spareAlpha;
+        ctx.fill(fading);
         ctx.globalAlpha = 1;
       }
 
@@ -291,19 +257,42 @@
   function drawMarker(t, r) {
     const d = dots[marker.index];
     if (!d) return;
-    const p = project(d.lon, d.lat);
-    const pulse = 0.7 + 0.3 * Math.sin((t - marker.born) * 3.0);
+    const x = sx(d.cx), y = sy(d.cy);
+    const accent = getVar("--accent");
+
+    // Crosshair: finding one lit dot in four thousand needs a pointer, and
+    // guides do that without inflating the dot into a lie about area.
+    ctx.strokeStyle = accent;
+    ctx.globalAlpha = 0.28;
+    ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-    ctx.globalAlpha = pulse;
-    ctx.fillStyle = getVar("--accent");
-    ctx.fill();
+    ctx.moveTo(x, view.y - 10); ctx.lineTo(x, y - r * 3);
+    ctx.moveTo(x, y + r * 3); ctx.lineTo(x, view.y + view.h + 10);
+    ctx.moveTo(view.x - 10, y); ctx.lineTo(x - r * 3, y);
+    ctx.moveTo(x + r * 3, y); ctx.lineTo(view.x + view.w + 10, y);
+    ctx.stroke();
+
+    // A breathing ring, drawn as an outline so the dot itself stays one dot.
+    const cycle = ((t - marker.born) % 1.9) / 1.9;
+    ctx.globalAlpha = 0.55 * (1 - cycle);
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.arc(x, y, r * 2 + cycle * view.cell * 7, 0, Math.PI * 2);
+    ctx.stroke();
     ctx.globalAlpha = 1;
+
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = accent;
+    ctx.fill();
 
     if (marker.label) {
       labelEl.textContent = marker.label;
-      labelEl.style.left = (p.x + r + 8) + "px";
-      labelEl.style.top = (p.y - 6) + "px";
+      const w = labelEl.offsetWidth || 80;
+      // Flip to the left near the right edge so the pill never runs off-screen.
+      const left = (x + 18 + w > cssW) ? x - 18 - w : x + 18;
+      labelEl.style.left = left + "px";
+      labelEl.style.top = (y - 10) + "px";
       labelEl.classList.add("on");
     }
   }
@@ -317,7 +306,7 @@
     return varCache[name];
   }
 
-  // ── Shapes ─────────────────────────────────────────────────────────────────
+  // ── Turning text and emoji into dot targets ────────────────────────────────
   const EMOJI = {
     dog:"🐕", cat:"🐈", heart:"❤️", star:"⭐", tree:"🌳", fish:"🐟", bird:"🐦",
     house:"🏠", home:"🏠", car:"🚗", plane:"✈️", rocket:"🚀", boat:"⛵",
@@ -332,93 +321,122 @@
     bear:"🐻", panda:"🐼", monkey:"🐒", elephant:"🐘", butterfly:"🦋",
     spider:"🕷️", bee:"🐝", crab:"🦀", octopus:"🐙", penguin:"🐧",
     wow:"😮", smile:"🙂", sad:"🙁", love:"💖", peace:"✌️", ok:"👌",
-    thumbsup:"👍", wave:"👋", eyes:"👀", zap:"⚡", tea:"🍵", sushi:"🍣",
-    burger:"🍔", icecream:"🍦", guitar:"🎸", football:"⚽", chess:"♟️",
-    dice:"🎲", trophy:"🏆", medal:"🏅", rainbow:"🌈", wave2:"🌊", volcano:"🌋",
-    mountain:"⛰️", cactus:"🌵", mushroom:"🍄", ghost2:"👾", magnet:"🧲",
+    wave:"👋", eyes:"👀", tea:"🍵", sushi:"🍣", burger:"🍔", guitar:"🎸",
+    football:"⚽", dice:"🎲", trophy:"🏆", rainbow:"🌈", volcano:"🌋",
+    mountain:"⛰️", cactus:"🌵", mushroom:"🍄", magnet:"🧲",
   };
 
-  function glyphTargets(text) {
-    const cols = grid.nCols, rows = grid.nRows;
-    const S = 6;
+  const FONT_STACK =
+    '"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",' +
+    '"Noto Sans","Noto Sans Devanagari","Noto Sans JP","Noto Sans SC",' +
+    '"Noto Sans KR","Noto Sans Thai",system-ui,ui-monospace,monospace';
+
+  const SUPER = 6;   // offscreen supersample per grid cell
+
+  /**
+   * Rasterise text inside a normalised box and return the grid cells it covers.
+   * The box lets several lines of chat stack without each one taking the whole
+   * screen.
+   */
+  function glyphTargets(text, box, minLit, screenSpace) {
+    // The sampling lattice has to be square in whatever space it covers. The
+    // map grid is 180x71 for a 2.57:1 box; reusing those counts over a tall
+    // viewport squashes every letter vertically.
+    const cols = grid.nCols;
+    const rows = screenSpace
+      ? Math.max(8, Math.round(cols * (cssH / Math.max(1, cssW))))
+      : grid.nRows;
+    const b = box || { x0: 0.03, y0: 0.14, x1: 0.97, y1: 0.86 };
+    // Small text has thin strokes, so demanding two lit sub-samples per cell
+    // punches holes in the letterforms. One is enough at chat size.
+    const need = minLit || 2;
     const off = document.createElement("canvas");
-    off.width = cols * S;
-    off.height = rows * S;
-    const octx = off.getContext("2d", { willReadFrequently: true });
-    octx.fillStyle = "#000";
-    octx.fillRect(0, 0, off.width, off.height);
-    octx.fillStyle = "#fff";
-    octx.textAlign = "center";
-    octx.textBaseline = "middle";
+    off.width = cols * SUPER;
+    off.height = rows * SUPER;
+    const o = off.getContext("2d", { willReadFrequently: true });
+    o.fillStyle = "#000";
+    o.fillRect(0, 0, off.width, off.height);
+    o.fillStyle = "#fff";
+    o.textAlign = "center";
+    o.textBaseline = "middle";
 
-    let size = off.height * 0.86;
-    const font = (s) =>
-      `900 ${s}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",ui-monospace,monospace`;
-    octx.font = font(size);
-    const w = octx.measureText(text).width;
-    if (w > off.width * 0.9) {
-      size = size * (off.width * 0.9) / w;
-      octx.font = font(size);
+    const bx = b.x0 * off.width, by = b.y0 * off.height;
+    const bw = (b.x1 - b.x0) * off.width, bh = (b.y1 - b.y0) * off.height;
+
+    let size = bh;
+    o.font = `900 ${size}px ${FONT_STACK}`;
+    const w = o.measureText(text).width;
+    if (w > bw) {
+      size = Math.max(4, size * bw / w);
+      o.font = `900 ${size}px ${FONT_STACK}`;
     }
-    octx.fillText(text, off.width / 2, off.height / 2);
+    o.fillText(text, bx + bw / 2, by + bh / 2);
 
-    const data = octx.getImageData(0, 0, off.width, off.height).data;
+    const data = o.getImageData(0, 0, off.width, off.height).data;
     const targets = [];
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         let lit = 0;
-        for (let sy = 1; sy < S; sy += 2) {
-          for (let sx = 1; sx < S; sx += 2) {
-            const i = ((r * S + sy) * off.width + (c * S + sx)) * 4;
+        for (let sy2 = 1; sy2 < SUPER; sy2 += 2) {
+          for (let sx2 = 1; sx2 < SUPER; sx2 += 2) {
+            const i = ((r * SUPER + sy2) * off.width + (c * SUPER + sx2)) * 4;
             if (data[i] > 80 || data[i + 1] > 80 || data[i + 2] > 80) lit++;
           }
         }
-        if (lit >= 2) targets.push({ gx: (c + 0.5) / cols, gy: (r + 0.5) / rows });
+        if (lit < need) continue;
+        let gx = (c + 0.5) / cols, gy = (r + 0.5) / rows;
+        if (screenSpace) {
+          // The lattice covered the whole viewport; convert back to the map's
+          // coordinate space, which is what the dots are drawn in.
+          gx = (gx * cssW - view.x) / view.w;
+          gy = (gy * cssH - view.y) / view.h;
+        }
+        targets.push({ gx, gy });
       }
     }
     return targets;
   }
 
-  function assignTargets(targets) {
-    for (const d of dots) { d.tgx = null; d.tgy = null; }
+  /** Move the dots onto a set of targets, starting from where they are now. */
+  function setTargets(targets) {
+    const n = dots.length;
+    const used = new Uint8Array(n);
+    for (const d of dots) { d.fx = d.cx; d.fy = d.cy; d.active = false; }
 
-    // Each target claims its nearest still-free dot. Rank-order assignment
-    // (sort both sides, pair them off) is cheaper but smears the glyph: the
-    // dots are distributed like continents and the targets like letters, so
-    // matching them by rank stretches one onto the other.
-    const hx = new Float32Array(dots.length);
-    const hy = new Float32Array(dots.length);
-    for (let i = 0; i < dots.length; i++) {
-      hx[i] = (dots[i].lon + 180) / 360;
-      hy[i] = (grid.latMax - dots[i].lat) / (grid.latMax - grid.latMin);
-    }
-    const used = new Uint8Array(dots.length);
-    let placed = 0;
     for (const t of targets) {
       let best = -1, bestD = Infinity;
-      for (let i = 0; i < dots.length; i++) {
+      for (let i = 0; i < n; i++) {
         if (used[i]) continue;
-        const dx = hx[i] - t.gx, dy = hy[i] - t.gy;
+        const dx = dots[i].cx - t.gx, dy = dots[i].cy - t.gy;
         const v = dx * dx + dy * dy;
         if (v < bestD) { bestD = v; best = i; }
       }
       if (best < 0) break;
       used[best] = 1;
-      dots[best].tgx = t.gx;
-      dots[best].tgy = t.gy;
-      placed++;
+      dots[best].tx = t.gx; dots[best].ty = t.gy; dots[best].active = true;
     }
-    return placed;
+    // Everything unused drifts home and fades out.
+    for (let i = 0; i < n; i++) {
+      if (!used[i]) { dots[i].tx = dots[i].hx; dots[i].ty = dots[i].hy; }
+    }
+    morphStart = performance.now() / 1000;
   }
 
-  function showGlyph(text, label) {
-    const targets = glyphTargets(text);
-    if (!targets.length) return false;
-    assignTargets(targets);
-    morph = { dir: 1, born: performance.now() / 1000 };
+  function goHome() {
+    for (const d of dots) {
+      d.fx = d.cx; d.fy = d.cy;
+      d.tx = d.hx; d.ty = d.hy;
+      d.active = true;
+    }
+    morphStart = performance.now() / 1000;
+  }
+
+  function showGlyph(text, box) {
+    const targets = glyphTargets(text, box);
+    if (targets.length < 6) return false;   // nothing rendered — missing glyph
+    setTargets(targets);
     marker = null;
     labelEl.classList.remove("on");
-    if (label !== undefined) setStatus(label);
     return true;
   }
 
@@ -427,39 +445,70 @@
     if (!clean) return;
     const key = clean.toLowerCase().replace(/[^a-z]/g, "");
     const glyph = EMOJI[key] || EMOJI[key.replace(/s$/, "")];
-    // Every word draws something: its emoji if it has one, otherwise itself.
-    showGlyph(glyph || clean.toUpperCase().slice(0, 12),
-              glyph ? `${clean} ${glyph}` : clean);
+    stopChat();
+    chatLines = [];
+    showGlyph(glyph || clean.toUpperCase().slice(0, 12));
+    setStatus(glyph ? `${clean} ${glyph}` : clean);
   }
 
-  function releaseShape() {
-    if (morph && morph.dir === 1) morph = { dir: -1, born: performance.now() / 1000 };
+  // ── Chat: a transcript in dots, small, stacking down from the top ──────────
+  const CHAT_MAX_LINES = 6;
+  const CHAT_WRAP = 14;        // characters per dot line — keeps glyphs legible
+  const CHAT_TOP = 0.07, CHAT_LINE = 0.10;   // fractions of SCREEN height
+
+  /**
+   * Chat is positioned against the SCREEN, not the map box. The map is
+   * letterboxed inside a tall window, so anchoring the transcript to the map
+   * would park it halfway down the page instead of at the top.
+   */
+  function chatTargets() {
+    let all = [];
+    const start = Math.max(0, chatLines.length - CHAT_MAX_LINES);
+    const visible = chatLines.slice(start);
+    visible.forEach((line, i) => {
+      const y0 = CHAT_TOP + i * CHAT_LINE;
+      all = all.concat(glyphTargets(line, {
+        x0: 0.08, y0, x1: 0.92, y1: y0 + CHAT_LINE * 0.74,
+      }, 1, true));
+    });
+    return all;
   }
 
-  // ── Chat: the reply is spelled out, one word at a time ──────────────────────
-  let sayTimer = null;
-  function sayWords(reply) {
-    clearTimeout(sayTimer);
-    const words = String(reply || "").split(/\s+/).filter(Boolean);
-    if (!words.length) { setStatus("nothing to say"); return; }
-    let k = 0;
-    const step = () => {
-      if (k >= words.length) {
-        sayTimer = setTimeout(() => { releaseShape(); setStatus(""); }, 1400);
-        return;
-      }
-      showGlyph(words[k], reply);
-      k++;
-      sayTimer = setTimeout(step, 1500);
-    };
-    step();
+  /** Break a reply into dot-width lines so a whole sentence stays legible. */
+  function wrap(text, width) {
+    const out = [];
+    let line = "";
+    for (const w of String(text).split(/\s+/).filter(Boolean)) {
+      if (!line) { line = w; continue; }
+      if ((line + " " + w).length <= width) line += " " + w;
+      else { out.push(line); line = w; }
+    }
+    if (line) out.push(line);
+    return out;
   }
+
+  function pushChatLine(text) {
+    const reply = String(text || "").trim();
+    if (!reply) { setStatus("nothing to say"); return; }
+    // The marker's crosshair would sit on top of the transcript.
+    marker = null;
+    labelEl.classList.remove("on");
+
+    for (const line of wrap(reply, CHAT_WRAP)) {
+      chatLines.push(line);
+      if (chatLines.length > CHAT_MAX_LINES) chatLines.shift();
+    }
+    setTargets(chatTargets());
+    setStatus(reply);
+  }
+
+  function stopChat() { clearTimeout(chatTimer); }
 
   // ── Reverse ────────────────────────────────────────────────────────────────
   function toggleReverse() {
     reversed = !reversed;
-    morph = null;
     marker = null;
+    chatLines = [];
     labelEl.classList.remove("on");
     buildDots();
     setStatus(reversed ? "reversed — the sea is the ink now" : "");
@@ -470,19 +519,18 @@
     if (!intent || !intent.intent) return;
     switch (intent.intent) {
       case "locate":
-        releaseShape();
+        stopChat(); chatLines = []; goHome();
         return doLocate(intent.params || {});
       case "shape":
         return doShape((intent.params || {}).word);
       case "chat":
-        return sayWords((intent.params || {}).reply);
+        return pushChatLine((intent.params || {}).reply);
       case "reverse":
-        releaseShape();
+        stopChat();
         return toggleReverse();
       case "idle":
       default:
-        marker = null;
-        releaseShape();
+        marker = null; stopChat(); chatLines = []; thread = []; goHome();
         labelEl.classList.remove("on");
         setStatus("");
     }
@@ -494,7 +542,8 @@
     marker = { index, born: performance.now() / 1000, label };
     const id = dots[index].country;
     const country = id >= 0 && grid.countries[id] ? grid.countries[id].name : null;
-    setStatus(label || country || "found it");
+    if (!marker.label) marker.label = country || "here";
+    setStatus(country || "found it");
   }
 
   async function doLocate(params) {
@@ -511,7 +560,7 @@
         { timeout: 8000, maximumAge: 600000 }
       );
     });
-    if (viaBrowser) { markAt(viaBrowser.lon, viaBrowser.lat, "you"); return; }
+    if (viaBrowser) { markAt(viaBrowser.lon, viaBrowser.lat, "you are here"); return; }
     try {
       const res = await fetch("/api/whereami");
       const d = await res.json();
@@ -521,6 +570,10 @@
   }
 
   // ── Director ───────────────────────────────────────────────────────────────
+  // The thread lives here, not on the server, so the reply can follow the
+  // conversation without the backend holding per-visitor state.
+  let thread = [];
+
   async function send(text) {
     stopIntro();
     setStatus("reading that", true);
@@ -528,10 +581,15 @@
       const res = await fetch("/api/intent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, history: thread.slice(-4) }),
       });
       if (!res.ok) throw new Error("intent " + res.status);
-      applyIntent(await res.json());
+      const intent = await res.json();
+      if (intent.intent === "chat") {
+        thread.push({ you: text, map: (intent.params || {}).reply || "" });
+        if (thread.length > 8) thread.shift();
+      }
+      applyIntent(intent);
     } catch (err) {
       setStatus("no answer from the server");
     }
@@ -549,7 +607,7 @@
   // ── Hints ──────────────────────────────────────────────────────────────────
   const HINTS = [
     "show my location", "draw a dog", "draw a cat", "talk to me",
-    "reverse", "spell your name", "a rocket", "51.5, -0.12",
+    "reverse", "a rocket", "51.5, -0.12", "what is this place",
   ];
   let hintIndex = 0;
   function updateHint() {
@@ -558,47 +616,64 @@
   function cycleHint() {
     if (input.value) return;
     hintEl.classList.add("out");
-    setTimeout(() => {
-      hintIndex++;
-      updateHint();
-      hintEl.classList.remove("out");
-    }, 450);
+    setTimeout(() => { hintIndex++; updateHint(); hintEl.classList.remove("out"); }, 450);
   }
   input.addEventListener("input", updateHint);
   setInterval(cycleHint, 3800);
 
-  // ── Intro: hello, going round the world ────────────────────────────────────
+  // ── Hello, on a loop, in its own script ────────────────────────────────────
+  // native is drawn; latin is what the status line says, so the greeting is
+  // always readable even when the viewer's machine lacks the font.
   const GREETINGS = [
-    ["HELLO", "english"], ["NAMASTE", "hindi"], ["CIAO", "italian"],
-    ["HOLA", "spanish"], ["BONJOUR", "french"], ["HALLO", "german"],
-    ["OLA", "portuguese"], ["PRIVET", "russian"], ["NI HAO", "chinese"],
-    ["KONNICHIWA", "japanese"], ["ANNYEONG", "korean"], ["HEJ", "swedish"],
-    ["JAMBO", "swahili"], ["ALOHA", "hawaiian"], ["KIA ORA", "maori"],
-    ["SAWASDEE", "thai"], ["ZDRAVO", "croatian"], ["AHOJ", "czech"],
-    ["SZIA", "hungarian"], ["XIN CHAO", "vietnamese"],
+    { native: "HELLO",      latin: "hello",      lang: "english" },
+    { native: "नमस्ते",       latin: "namaste",    lang: "hindi" },
+    { native: "CIAO",       latin: "ciao",       lang: "italian" },
+    { native: "HOLA",       latin: "hola",       lang: "spanish" },
+    { native: "BONJOUR",    latin: "bonjour",    lang: "french" },
+    { native: "HALLO",      latin: "hallo",      lang: "german" },
+    { native: "OLÁ",        latin: "ola",        lang: "portuguese" },
+    { native: "Привет",     latin: "privet",     lang: "russian" },
+    { native: "你好",        latin: "ni hao",     lang: "chinese" },
+    { native: "こんにちは",    latin: "konnichiwa", lang: "japanese" },
+    { native: "안녕하세요",    latin: "annyeong",   lang: "korean" },
+    { native: "สวัสดี",       latin: "sawasdee",   lang: "thai" },
+    { native: "Γεια σου",   latin: "yia sou",    lang: "greek" },
+    { native: "CZEŚĆ",      latin: "czesc",      lang: "polish" },
+    { native: "HEJ",        latin: "hej",        lang: "swedish" },
+    { native: "HEI",        latin: "hei",        lang: "norwegian" },
+    { native: "MOI",        latin: "moi",        lang: "finnish" },
+    { native: "AHOJ",       latin: "ahoj",       lang: "czech" },
+    { native: "SZIA",       latin: "szia",       lang: "hungarian" },
+    { native: "ZDRAVO",     latin: "zdravo",     lang: "croatian" },
+    { native: "SALUT",      latin: "salut",      lang: "romanian" },
+    { native: "XIN CHÀO",   latin: "xin chao",   lang: "vietnamese" },
+    { native: "HALO",       latin: "halo",       lang: "indonesian" },
+    { native: "KAMUSTA",    latin: "kamusta",    lang: "filipino" },
+    { native: "JAMBO",      latin: "jambo",      lang: "swahili" },
+    { native: "SAWUBONA",   latin: "sawubona",   lang: "zulu" },
+    { native: "ALOHA",      latin: "aloha",      lang: "hawaiian" },
+    { native: "KIA ORA",    latin: "kia ora",    lang: "maori" },
+    { native: "নমস্কার",      latin: "nomoskar",   lang: "bengali" },
+    { native: "ਸਤ ਸ੍ਰੀ ਅਕਾਲ",  latin: "sat sri akal", lang: "punjabi" },
   ];
 
+  let greetIndex = 0;
   function startIntro() {
-    let k = 0;
     const order = GREETINGS.slice().sort(() => Math.random() - 0.5);
     const step = () => {
-      if (k >= 5) {           // five hellos, then settle into the map
-        releaseShape();
-        setStatus("");
-        introTimer = null;
-        return;
-      }
-      const [word, lang] = order[k];
-      showGlyph(word, `${word.toLowerCase()} · ${lang}`);
-      k++;
-      introTimer = setTimeout(step, 1700);
+      const g = order[greetIndex % order.length];
+      greetIndex++;
+      // If the machine has no font for the script, nothing renders — say it in
+      // Latin rather than showing an empty screen.
+      if (!showGlyph(g.native)) showGlyph(g.latin.toUpperCase());
+      setStatus(`${g.latin} · ${g.lang}`);
+      introTimer = setTimeout(step, 2600);
     };
     step();
   }
 
   function stopIntro() {
     if (introTimer) { clearTimeout(introTimer); introTimer = null; }
-    clearTimeout(sayTimer);
   }
 
   new ResizeObserver(layout).observe(canvas);
@@ -608,7 +683,7 @@
     .then(() => {
       requestAnimationFrame(draw);
       updateHint();
-      setTimeout(startIntro, 500);
+      setTimeout(startIntro, 400);
     })
     .catch(() => setStatus("the map did not load"));
 })();
