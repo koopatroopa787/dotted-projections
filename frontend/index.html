@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dotted Projections</title>
+<style>
+  :root {
+    --bg: #080b11;
+    --dot: #2f3d52;
+    --dot-lit: #46597a;
+    --accent: #ffb454;
+    --accent-soft: rgba(255, 180, 84, 0.18);
+    --text: #7c8ba3;
+    --text-bright: #c6d2e3;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); }
+  body {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  #map { display: block; width: 100vw; height: 100vh; }
+
+  /* Chrome stays out of the way — the map is the interface. */
+  #console {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: max(28px, env(safe-area-inset-bottom));
+    width: min(560px, calc(100vw - 32px));
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: rgba(10, 14, 21, 0.72);
+    border: 1px solid rgba(124, 139, 163, 0.18);
+    border-radius: 2px;
+    backdrop-filter: blur(8px);
+  }
+  #console::before {
+    content: "›";
+    color: var(--accent);
+    font-size: 14px;
+    line-height: 1;
+  }
+  #cmd {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text-bright);
+    font: inherit;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+  }
+  #cmd::placeholder { color: rgba(124, 139, 163, 0.5); }
+
+  #status {
+    position: fixed;
+    top: max(20px, env(safe-area-inset-top));
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text);
+    opacity: 0.55;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  #label {
+    position: fixed;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .5s ease;
+    text-shadow: 0 0 12px rgba(0,0,0,.9);
+    white-space: nowrap;
+  }
+  #label.on { opacity: 1; }
+  .spin { display: inline-block; animation: blink 1.2s steps(2) infinite; }
+  @keyframes blink { 0%,50% { opacity: 1 } 50.01%,100% { opacity: .25 } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none } }
+</style>
+</head>
+<body>
+<canvas id="map"></canvas>
+<div id="status">initialising</div>
+<div id="label"></div>
+<form id="console" autocomplete="off">
+  <input id="cmd" name="cmd" placeholder="show my location" aria-label="command">
+</form>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("map");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const statusEl = document.getElementById("status");
+  const labelEl = document.getElementById("label");
+  const form = document.getElementById("console");
+  const input = document.getElementById("cmd");
+
+  const setStatus = (t, busy) => {
+    statusEl.innerHTML = busy ? `<span class="spin">•</span> ${t}` : t;
+  };
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let grid = null;      // dots.json
+  let dots = [];        // { lon, lat, country, phase, hx, hy } in grid space
+  let view = { x: 0, y: 0, w: 1, h: 1, cell: 1 };
+  let marker = null;    // { lon, lat, index, born, label }
+  let dpr = 1;
+
+  // ── Projection ─────────────────────────────────────────────────────────────
+  // Equirectangular. The grid is cropped in latitude, so the drawn box is
+  // 360deg wide by (latMax-latMin) tall — not the usual 2:1.
+  let cssW = 0, cssH = 0;
+
+  function layout() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // Measure the element, not the window: under page zoom the two disagree
+    // (100vw can resolve to 1280 while innerWidth reports 456), and sizing the
+    // drawing from the window then stretches it across a differently-sized
+    // canvas.
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(1, Math.round(rect.width));
+    const h = Math.max(1, Math.round(rect.height));
+    cssW = w; cssH = h;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    if (!grid) return;
+    const spanLon = 360, spanLat = grid.latMax - grid.latMin;
+    const aspect = spanLon / spanLat;
+    // Fill the viewport while keeping geography undistorted.
+    const pad = 0.945;
+    let vw = w * pad, vh = vw / aspect;
+    if (vh > h * pad) { vh = h * pad; vw = vh * aspect; }
+    view = { x: (w - vw) / 2, y: (h - vh) / 2, w: vw, h: vh, cell: vw / (spanLon / grid.step) };
+  }
+
+  const project = (lon, lat) => ({
+    x: view.x + ((lon + 180) / 360) * view.w,
+    y: view.y + ((grid.latMax - lat) / (grid.latMax - grid.latMin)) * view.h,
+  });
+
+  // ── Data ───────────────────────────────────────────────────────────────────
+  async function loadGrid() {
+    const res = await fetch("dots.json");
+    if (!res.ok) throw new Error("dots.json " + res.status);
+    grid = await res.json();
+
+    dots = new Array(grid.count);
+    for (let i = 0; i < grid.count; i++) {
+      const lon = grid.lonMin + grid.cols[i] * grid.step;
+      const lat = grid.latMax - grid.rows[i] * grid.step;
+      dots[i] = {
+        lon, lat,
+        country: grid.countryIds[i],
+        // Deterministic per-dot phase so the drift looks organic, not uniform.
+        phase: (Math.sin(lon * 12.9898 + lat * 78.233) * 43758.5453) % (Math.PI * 2),
+      };
+    }
+    layout();
+  }
+
+  function nearestDot(lon, lat) {
+    // Longitude wraps; compare on the short way round.
+    let best = -1, bestD = Infinity;
+    for (let i = 0; i < dots.length; i++) {
+      let dLon = Math.abs(dots[i].lon - lon);
+      if (dLon > 180) dLon = 360 - dLon;
+      // Degrees of longitude shrink toward the poles.
+      const dx = dLon * Math.cos((lat * Math.PI) / 180);
+      const dy = dots[i].lat - lat;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const DRIFT = 0.30;   // px, peak displacement of the idle wander
+
+  function draw(now) {
+    const t = now / 1000;
+    const w = cssW, h = cssH;
+
+    ctx.fillStyle = getVar("--bg");
+    ctx.fillRect(0, 0, w, h);
+
+    if (grid) {
+      const r = Math.max(0.7, view.cell * 0.30);
+
+      // One path for every base dot, filled once — 10k individual fill calls
+      // would not hold 60fps, one fill of 10k subpaths does.
+      const path = new Path2D();
+      for (let i = 0; i < dots.length; i++) {
+        const d = dots[i];
+        const p = project(d.lon, d.lat);
+        const wob = Math.sin(t * 0.55 + d.phase) * DRIFT;
+        const wob2 = Math.cos(t * 0.41 + d.phase * 1.7) * DRIFT;
+        path.moveTo(p.x + wob + r, p.y + wob2);
+        path.arc(p.x + wob, p.y + wob2, r, 0, Math.PI * 2);
+      }
+      ctx.fillStyle = getVar("--dot");
+      ctx.fill(path);
+
+      if (marker) drawMarker(t, r);
+    }
+    requestAnimationFrame(draw);
+  }
+
+  function drawMarker(t, r) {
+    const d = dots[marker.index];
+    if (!d) return;
+    const p = project(d.lon, d.lat);
+    const age = t - marker.born;
+
+    // Expanding ring, repeating slowly.
+    const cycle = (age % 2.6) / 2.6;
+    const ringR = r * 2 + cycle * view.cell * 5;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, ringR, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,180,84,${0.5 * (1 - cycle)})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Neighbours glow, so the mark reads as a place, not a pixel.
+    const glow = new Path2D();
+    for (let i = 0; i < dots.length; i++) {
+      const o = dots[i];
+      if (Math.abs(o.lon - d.lon) > grid.step * 2.2) continue;
+      if (Math.abs(o.lat - d.lat) > grid.step * 2.2) continue;
+      if (i === marker.index) continue;
+      const q = project(o.lon, o.lat);
+      glow.moveTo(q.x + r, q.y);
+      glow.arc(q.x, q.y, r, 0, Math.PI * 2);
+    }
+    ctx.fillStyle = getVar("--dot-lit");
+    ctx.fill(glow);
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r * 1.9, 0, Math.PI * 2);
+    ctx.fillStyle = getVar("--accent");
+    ctx.fill();
+
+    if (marker.label) {
+      labelEl.textContent = marker.label;
+      labelEl.style.left = (p.x + 14) + "px";
+      labelEl.style.top = (p.y - 6) + "px";
+      labelEl.classList.add("on");
+    }
+  }
+
+  const varCache = {};
+  function getVar(name) {
+    if (!varCache[name]) {
+      varCache[name] = getComputedStyle(document.documentElement)
+        .getPropertyValue(name).trim();
+    }
+    return varCache[name];
+  }
+
+  // ── Intents ────────────────────────────────────────────────────────────────
+  // The director only ever emits one of these. All motion is client-side.
+  function applyIntent(intent) {
+    if (!intent || !intent.intent) return;
+    switch (intent.intent) {
+      case "locate":
+        return doLocate(intent.params || {});
+      case "idle":
+      default:
+        marker = null;
+        labelEl.classList.remove("on");
+        setStatus("idle");
+    }
+  }
+
+  function markAt(lon, lat, label) {
+    const index = nearestDot(lon, lat);
+    if (index < 0) { setStatus("no land dot near that point"); return; }
+    marker = { index, born: performance.now() / 1000, label };
+    const country = grid.countries[dots[index].country];
+    setStatus(label || (country ? country.name : "located"));
+  }
+
+  async function doLocate(params) {
+    if (typeof params.lat === "number" && typeof params.lon === "number") {
+      markAt(params.lon, params.lat, params.label);
+      return;
+    }
+    setStatus("resolving position", true);
+
+    // Browser geolocation first; it is the accurate one and needs consent.
+    const viaBrowser = await new Promise((resolve) => {
+      if (!navigator.geolocation) return resolve(null);
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+        () => resolve(null),
+        { timeout: 8000, maximumAge: 600000 }
+      );
+    });
+    if (viaBrowser) { markAt(viaBrowser.lon, viaBrowser.lat, "you"); return; }
+
+    // Denied or unavailable — fall back to IP geolocation via the backend,
+    // which keeps the third-party call off the page's origin.
+    try {
+      const res = await fetch("/api/whereami");
+      const d = await res.json();
+      if (typeof d.lat === "number") {
+        markAt(d.lon, d.lat, d.city || "approx");
+        return;
+      }
+    } catch (_) { /* fall through */ }
+    setStatus("could not resolve position");
+  }
+
+  // ── Director ───────────────────────────────────────────────────────────────
+  async function send(text) {
+    setStatus("thinking", true);
+    try {
+      const res = await fetch("/api/intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error("intent " + res.status);
+      applyIntent(await res.json());
+    } catch (err) {
+      setStatus("director unreachable");
+    }
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    send(text);
+  });
+
+  // ResizeObserver catches zoom and container changes that resize events miss.
+  new ResizeObserver(layout).observe(canvas);
+  window.addEventListener("resize", layout);
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+  loadGrid()
+    .then(() => {
+      setStatus(`${grid.count.toLocaleString()} land dots · ${grid.step}° grid`);
+      requestAnimationFrame(draw);
+      setTimeout(() => setStatus("idle"), 3200);
+    })
+    .catch((err) => setStatus("map failed: " + err.message));
+})();
+</script>
+</body>
+</html>
