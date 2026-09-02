@@ -221,10 +221,7 @@ async def classify(cmd: Command):
 
     if decision["intent"] == "aircraft":
         q = await _parse_with(PLANE_SCHEMA, PLANE_PROMPT, text, {"place": ""})
-        place = str(q.get("place") or "").lower().strip()
-        # The model offers a plausible country for questions that named none.
-        if place and place not in text.lower():
-            place = ""
+        place = _accept_place(q.get("place"), text)
         box = await geocode_box(place) if place else None
         if place and box is None:
             place = ""            # unresolvable name: show the world, say so
@@ -276,9 +273,7 @@ async def classify(cmd: Command):
             MARKET_SCHEMA, MARKET_PROMPT, text,
             {"region": "", "place": "", "only_open": False, "sort": "region"},
         )
-        place = str(q.get("place") or "").lower().strip()
-        if place and place not in text.lower():
-            place = ""            # a place the user never typed is invented
+        place = _accept_place(q.get("place"), text)
         # A continent is a region, not a city. Left in place it becomes a
         # substring search for "asia" inside city names, which matches nothing
         # and silently empties the result.
@@ -409,11 +404,7 @@ def _clamp_query(parsed: Dict[str, Any], text: str) -> Dict[str, Any]:
     pinned = _magnitude_from_words(text)
     if pinned is not None:
         mag = pinned
-    place = str(parsed.get("place") or "").strip().lower()[:40]
-    # A place the user never typed is a hallucination, and it would silently
-    # filter every real result away.
-    if place and place not in text.lower():
-        place = ""
+    place = _accept_place(parsed.get("place"), text)
     window = parsed.get("window")
     sort = parsed.get("sort")
     lowered = text.lower()
@@ -531,6 +522,36 @@ def _pin_region(text: str) -> str:
         if re.search(pattern, lowered, re.I):
             return region
     return ""
+
+
+# Locative cue: the difference between a question that is asking about a place
+# and one that is not.
+LOCATIVE = re.compile(
+    r"\b(over|in|near|above|around|at|across|within|from)\b", re.IGNORECASE
+)
+
+
+def _accept_place(model_place: str, text: str) -> str:
+    """
+    Decide whether to trust the model's place.
+
+    Requiring the place to appear verbatim in the text was too strict: it threw
+    away the one thing the model can do that a regex cannot. It resolves "the
+    land of the rising sun" to japan and "the maple leaf flag" to canada, and
+    the verbatim test discarded both. Measured over 28 phrasings, that guard
+    was why disabling the model changed 1 answer.
+
+    So: a place echoed in the text is always fine, and an inferred place is
+    accepted only when the sentence actually points somewhere. "How many planes
+    are in the air" names nowhere and has no locative cue, so an invented
+    country is still rejected.
+    """
+    place = (model_place or "").strip().lower()[:40]
+    if not place:
+        return ""
+    if place in text.lower():
+        return place
+    return place if LOCATIVE.search(text) else ""
 
 
 async def _parse_with(schema: Dict[str, Any], prompt: str, text: str,
