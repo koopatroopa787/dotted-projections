@@ -23,6 +23,8 @@ from quakes import fetch_quakes, filter_quakes, summarise
 from markets import fetch_markets, filter_markets, summarise as summarise_markets
 from world import aurora_tonight, summarise_aurora
 from markets import EXCHANGES
+from aircraft import (fetch_aircraft, geocode_box, filter_aircraft, in_box,
+                      summarise as summarise_aircraft)
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.getenv("DOTTED_MODEL", "qwen2.5:0.5b-instruct")
@@ -59,6 +61,10 @@ MAP_HINTS = re.compile(
     re.IGNORECASE,
 )
 
+PLANE_HINTS = re.compile(
+    r"\b(plane|planes|aircraft|flight|flights|flying|airborne|aviation|air traffic|jets?)\b",
+    re.IGNORECASE,
+)
 AURORA_HINTS = re.compile(
     r"\b(aurora|northern lights|southern lights|borealis|australis)\b",
     re.IGNORECASE,
@@ -148,6 +154,9 @@ def _fallback(text: str) -> Dict[str, Any]:
     if MAP_HINTS.match(text):
         return {"intent": "idle", "params": {}}
 
+    if PLANE_HINTS.search(text):
+        return {"intent": "aircraft", "params": {}}
+
     if AURORA_HINTS.search(text):
         return {"intent": "aurora", "params": {}}
 
@@ -209,6 +218,38 @@ async def classify(cmd: Command):
     # invented coordinates. The model's job is writing the chat reply, which is
     # the one thing here a regex cannot do.
     decision = _fallback(text)
+
+    if decision["intent"] == "aircraft":
+        q = await _parse_with(PLANE_SCHEMA, PLANE_PROMPT, text, {"place": ""})
+        place = str(q.get("place") or "").lower().strip()
+        # The model offers a plausible country for questions that named none.
+        if place and place not in text.lower():
+            place = ""
+        box = await geocode_box(place) if place else None
+        if place and box is None:
+            place = ""            # unresolvable name: show the world, say so
+
+        feed = await fetch_aircraft()
+        planes = feed["planes"]
+        in_area = [p for p in planes if box is None or in_box(p, box)]
+        shown = filter_aircraft(planes, box)
+        return JSONResponse({
+            "intent": "aircraft",
+            "params": {
+                "aircraft": shown,
+                "in_area": len(in_area),
+                "total": len(planes),
+                "place": place,
+                "box": list(box) if box else None,
+                "stale": feed.get("stale", False),
+                "credits_left": feed.get("remaining"),
+                "summary": summarise_aircraft(
+                    len(shown), len(in_area), len(planes), place,
+                    feed.get("stale", False), feed.get("remaining"),
+                ),
+            },
+            "via": q.get("via", "rule"),
+        })
 
     if decision["intent"] == "aurora":
         q = await _parse_with(
@@ -414,6 +455,17 @@ async def _parse_quake_query(text: str) -> Dict[str, Any]:
                 "sort": "magnitude", "via": "fallback"}
 
 
+
+PLANE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {"place": {"type": "string"}},
+    "required": ["place"],
+}
+PLANE_PROMPT = (
+    "Extract the place a flight question is about. JSON only. "
+    "place: the country, region, state or city named, lowercase. "
+    "Empty string if the user named nowhere. Never invent a place."
+)
 
 AURORA_SCHEMA: Dict[str, Any] = {
     "type": "object",

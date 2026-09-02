@@ -619,6 +619,25 @@
   function drawOverlay(t, r) {
     if (!overlay || !overlay.points.length) return;
     const accent = getVar("--accent");
+
+    // Hundreds of aircraft cannot each get a pulsing ring — it reads as one
+    // smear. Dense layers draw as plain marks in a single batched fill.
+    if (overlay.dense) {
+      const path = new Path2D();
+      for (const pt of overlay.points) {
+        const x = sx((pt.lon + 180) / 360);
+        const y = sy((grid.latMax - pt.lat) / (grid.latMax - grid.latMin));
+        if (x < -20 || x > cssW + 20 || y < -20 || y > cssH + 20) continue;
+        path.moveTo(x + r * 0.62, y);
+        path.arc(x, y, r * 0.62, 0, Math.PI * 2);
+      }
+      ctx.fillStyle = accent;
+      ctx.globalAlpha = 0.85;
+      ctx.fill(path);
+      ctx.globalAlpha = 1;
+      return;
+    }
+
     for (const pt of overlay.points) {
       const x = sx((pt.lon + 180) / 360);
       const y = sy((grid.latMax - pt.lat) / (grid.latMax - grid.latMin));
@@ -644,13 +663,13 @@
     }
   }
 
-  function showOverlay(kind, points, summary) {
+  function showOverlay(kind, points, summary, dense) {
     stopIntro();
     chatLines = [];
     marker = null;
     labelEl.classList.remove("on");
     goHome();
-    overlay = { kind, points, summary };
+    overlay = { kind, points, summary, dense: !!dense };
     setStatus(summary || kind);
   }
 
@@ -684,6 +703,12 @@
           (q.quakes || []).map((k) => ({
             lon: k.lon, lat: k.lat, value: Math.max(0, (k.mag - 2)) / 5,
           })), q.summary);
+      }
+      case "aircraft": {
+        const q = intent.params || {};
+        return showOverlay("aircraft",
+          (q.aircraft || []).map((a) => ({ lon: a.lon, lat: a.lat })),
+          q.summary, true);
       }
       case "shape":
         overlay = null;
@@ -772,7 +797,8 @@
 
   // ── Hints ──────────────────────────────────────────────────────────────────
   const HINTS = [
-    "where can i see the aurora tonight", "which markets are open right now",
+    "where can i see the aurora tonight", "flights over europe",
+    "which markets are open right now",
     "earthquakes near japan", "show my location", "how is asia doing",
     "draw a dog", "talk to me", "reverse", "51.5, -0.12",
   ];
