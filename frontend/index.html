@@ -129,6 +129,7 @@
   const MORPH_SECONDS =
     new URLSearchParams(location.search).has("slow") ? 7 : 1.05;
 
+  let overlay = null;   // { kind, points:[{lon,lat,value,label,on}], summary }
   let introTimer = null, chatTimer = null;
   let chatLines = [];
 
@@ -234,13 +235,16 @@
       // Three groups: dots that were already lit, dots joining the shape (they
       // have to fade in or they pop into existence mid-flight), and dots
       // leaving it.
+      updateSun(now);
       const solid = new Path2D();
+      const night = new Path2D();
       const arriving = new Path2D();
       const leaving = new Path2D();
       for (let i = 0; i < dots.length; i++) {
         const d = dots[i];
         d.cx = d.fx + (d.tx - d.fx) * p;
         d.cy = d.fy + (d.ty - d.fy) * p;
+        const inShape = d.tx !== d.hx || d.ty !== d.hy;
 
         // Dormant: faded out already and not wanted by this shape either. Drawn
         // at all, it flashes back to full opacity at the start of every morph,
@@ -251,12 +255,19 @@
 
         const x = sx(d.cx) + Math.sin(t * 0.55 + d.phase) * drift;
         const y = sy(d.cy) + Math.cos(t * 0.41 + d.phase * 1.7) * drift;
-        const into = !d.active ? leaving : (d.wasActive === false ? arriving : solid);
+        // Only shade while the map is the map; a word made of dots should
+        // not be half in shadow.
+        const into = !d.active ? leaving
+          : (d.wasActive === false ? arriving
+          : (p >= 1 && !inShape && !dotIsLit(d) ? night : solid));
         into.moveTo(x + r, y);
         into.arc(x, y, r, 0, Math.PI * 2);
       }
       ctx.fillStyle = getVar("--dot");
       ctx.fill(solid);
+      ctx.globalAlpha = 0.30;          // the night side of the planet
+      ctx.fill(night);
+      ctx.globalAlpha = 1;
 
       // Arrivals stay invisible until they are most of the way across. They set
       // off from wherever they faded out — often still in map formation — so
@@ -273,6 +284,7 @@
       }
       ctx.globalAlpha = 1;
 
+      if (overlay) drawOverlay(t, r);
       if (marker) drawMarker(t, r);
     }
     requestAnimationFrame(draw);
@@ -328,6 +340,52 @@
         .getPropertyValue(name).trim();
     }
     return varCache[name];
+  }
+
+
+  // ── Where the sun is ───────────────────────────────────────────────────────
+  // NOAA's low-precision algorithm. Good to about a tenth of a degree, which is
+  // far inside what "is it night there" needs, and it costs no network call.
+  function solarElevation(lat, lon, now) {
+    const start = Date.UTC(now.getUTCFullYear(), 0, 0);
+    const day = Math.floor((now - start) / 86400000);
+    const hour = now.getUTCHours() + now.getUTCMinutes() / 60 + now.getUTCSeconds() / 3600;
+    const f = (2 * Math.PI / 365) * (day - 1 + (hour - 12) / 24);
+    const eqTime = 229.18 * (0.000075 + 0.001868 * Math.cos(f) - 0.032077 * Math.sin(f)
+      - 0.014615 * Math.cos(2 * f) - 0.040849 * Math.sin(2 * f));
+    const decl = 0.006918 - 0.399912 * Math.cos(f) + 0.070257 * Math.sin(f)
+      - 0.006758 * Math.cos(2 * f) + 0.000907 * Math.sin(2 * f)
+      - 0.002697 * Math.cos(3 * f) + 0.00148 * Math.sin(3 * f);
+    const trueSolar = (hour * 60 + eqTime + 4 * lon + 1440) % 1440;
+    const ha = (trueSolar / 4 - 180) * Math.PI / 180;
+    const latR = lat * Math.PI / 180;
+    const cosZ = Math.sin(latR) * Math.sin(decl)
+      + Math.cos(latR) * Math.cos(decl) * Math.cos(ha);
+    return Math.asin(Math.max(-1, Math.min(1, cosZ))) * 180 / Math.PI;
+  }
+
+  let sunDecl = 0, sunLonRad = 0, sunAt = 0;
+  function updateSun(nowMs) {
+    // The subsolar point moves 15 degrees an hour; recomputing it every frame
+    // for every dot would be thousands of pointless trig calls a second.
+    if (nowMs - sunAt < 20000 && sunAt) return;
+    sunAt = nowMs;
+    const now = new Date();
+    const start = Date.UTC(now.getUTCFullYear(), 0, 0);
+    const day = Math.floor((now - start) / 86400000);
+    const hour = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const f = (2 * Math.PI / 365) * (day - 1 + (hour - 12) / 24);
+    const eqTime = 229.18 * (0.000075 + 0.001868 * Math.cos(f) - 0.032077 * Math.sin(f)
+      - 0.014615 * Math.cos(2 * f) - 0.040849 * Math.sin(2 * f));
+    sunDecl = 0.006918 - 0.399912 * Math.cos(f) + 0.070257 * Math.sin(f)
+      - 0.006758 * Math.cos(2 * f) + 0.000907 * Math.sin(2 * f)
+      - 0.002697 * Math.cos(3 * f) + 0.00148 * Math.sin(3 * f);
+    sunLonRad = -(hour * 60 + eqTime - 720) / 4 * Math.PI / 180;
+  }
+
+  function dotIsLit(d) {
+    return d.sinLat * Math.sin(sunDecl)
+      + d.cosLat * Math.cos(sunDecl) * Math.cos(d.lonRad - sunLonRad) > -0.105;
   }
 
   // ── Turning text and emoji into dot targets ────────────────────────────────
@@ -556,23 +614,89 @@
     setStatus(reversed ? "reversed — the sea is the ink now" : "");
   }
 
+
+  // ── Live data drawn over the map ───────────────────────────────────────────
+  function drawOverlay(t, r) {
+    if (!overlay || !overlay.points.length) return;
+    const accent = getVar("--accent");
+    for (const pt of overlay.points) {
+      const x = sx((pt.lon + 180) / 360);
+      const y = sy((grid.latMax - pt.lat) / (grid.latMax - grid.latMin));
+      if (x < -20 || x > cssW + 20) continue;
+
+      // Magnitude, aurora strength or percent move sets the RING, never the
+      // dot: an inflated dot claims the event covers more ground than it does.
+      const ring = r * 2 + (pt.value || 0) * view.cell * 0.9;
+      const cycle = ((t * 0.55) + (pt.lon + pt.lat) * 0.01) % 1;
+      ctx.beginPath();
+      ctx.arc(x, y, ring * (0.6 + cycle * 0.9), 0, Math.PI * 2);
+      ctx.strokeStyle = accent;
+      ctx.globalAlpha = 0.5 * (1 - cycle);
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(x, y, r * 1.15, 0, Math.PI * 2);
+      ctx.globalAlpha = pt.on === false ? 0.35 : 1;
+      ctx.fillStyle = accent;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function showOverlay(kind, points, summary) {
+    stopIntro();
+    chatLines = [];
+    marker = null;
+    labelEl.classList.remove("on");
+    goHome();
+    overlay = { kind, points, summary };
+    setStatus(summary || kind);
+  }
+
   // ── Intents ────────────────────────────────────────────────────────────────
   function applyIntent(intent) {
     if (!intent || !intent.intent) return;
     switch (intent.intent) {
       case "locate":
+        overlay = null;
         stopChat(); chatLines = []; goHome();
         return doLocate(intent.params || {});
+      case "aurora": {
+        const q = intent.params || {};
+        return showOverlay("aurora",
+          (q.visible || []).map((v) => ({
+            lon: v.lon, lat: v.lat, value: v.prob / 60,
+          })), q.summary);
+      }
+      case "markets": {
+        const q = intent.params || {};
+        return showOverlay("markets",
+          (q.markets || []).map((m) => ({
+            lon: m.lon, lat: m.lat,
+            value: Math.min(3, Math.abs(m.change_pct || 0)) / 3,
+            on: m.open_now,
+          })), q.summary);
+      }
+      case "quakes": {
+        const q = intent.params || {};
+        return showOverlay("quakes",
+          (q.quakes || []).map((k) => ({
+            lon: k.lon, lat: k.lat, value: Math.max(0, (k.mag - 2)) / 5,
+          })), q.summary);
+      }
       case "shape":
+        overlay = null;
         return doShape((intent.params || {}).word);
       case "chat":
+        overlay = null;
         return pushChatLine((intent.params || {}).reply);
       case "reverse":
         stopChat();
         return toggleReverse();
       case "idle":
       default:
-        marker = null; stopChat(); chatLines = []; thread = []; goHome();
+        marker = null; overlay = null; stopChat(); chatLines = []; thread = []; goHome();
         labelEl.classList.remove("on");
         setStatus("");
     }
@@ -648,8 +772,9 @@
 
   // ── Hints ──────────────────────────────────────────────────────────────────
   const HINTS = [
-    "show my location", "draw a dog", "draw a cat", "talk to me",
-    "reverse", "a rocket", "51.5, -0.12", "what is this place",
+    "where can i see the aurora tonight", "which markets are open right now",
+    "earthquakes near japan", "show my location", "how is asia doing",
+    "draw a dog", "talk to me", "reverse", "51.5, -0.12",
   ];
   let hintIndex = 0;
   function updateHint() {
