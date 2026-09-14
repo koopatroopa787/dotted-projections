@@ -27,7 +27,7 @@ from aircraft import (fetch_aircraft, geocode_box, filter_aircraft, in_box,
                       summarise as summarise_aircraft)
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-MODEL = os.getenv("DOTTED_MODEL", "qwen2.5:0.5b-instruct")
+MODEL = os.getenv("DOTTED_MODEL", "qwen2.5:3b-instruct")
 REQUEST_TIMEOUT = 25.0
 
 app = FastAPI(title="Dotted Projections director")
