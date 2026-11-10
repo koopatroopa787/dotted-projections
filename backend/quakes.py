@@ -24,7 +24,7 @@ import httpx
 FEEDS = {
     "hour": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson",
     "day": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson",
-    "week": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_week.geojson",
+    "week": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson",
 }
 DEFAULT_WINDOW = "day"
 CACHE_SECONDS = 60          # USGS refreshes about once a minute
